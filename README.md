@@ -140,6 +140,35 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 | reg_default_noretrieval.json | Default **regression task** inference configuration file **without retrieval** | Faster speed, lower memory requirements |
 | reg_default_noretrieval_MVI.json | Default inference configuration file for **missing value imputation task** |  |
 
+
+## ➩ GUI Front-End (LimiX2Cheese)
+A lightweight desktop GUI has been added as `limix_gui.py` for one-click inference workflows.
+
+### Features
+- Auto-check missing dependencies (with one-click install)
+- Select input file (`csv/xlsx/xls`)
+- Select task (classification / regression / missing-value imputation)
+- Select local `.ckpt` model or auto-download from Hugging Face
+- Multi-select regression target columns
+- Progress bar + real-time logs
+- Export prediction `csv`, run metadata `json`, and `log` file
+
+### Launch
+```bash
+python limix_gui.py
+# or Linux/macOS
+./run_gui.sh
+# or Windows double-click
+run_gui.bat
+```
+
+### Package as EXE (optional)
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name LimiX2Cheese-GUI limix_gui.py
+```
+The generated executable will be in `dist/LimiX2Cheese-GUI(.exe)`.
+
 ## ➩ Ensemble Inference Based on Sample Retrieval
 
 For a detailed technical introduction to Ensemble Inference Based on Sample Retrieval, please refer to the [technical report](https://github.com/limix-ldm/LimiX/blob/main/LimiX_Technical_Report.pdf).
