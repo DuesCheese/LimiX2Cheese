@@ -140,6 +140,10 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 | reg_default_noretrieval.json | Default **regression task** inference configuration file **without retrieval** | Faster speed, lower memory requirements |
 | reg_default_noretrieval_MVI.json | Default inference configuration file for **missing value imputation task** |  |
 
+
+## ➩ GUI Front-End (LimiX2Cheese)
+For GUI usage details, please see [`doc/gui_usage.md`](doc/gui_usage.md).
+
 ## ➩ Ensemble Inference Based on Sample Retrieval
 
 For a detailed technical introduction to Ensemble Inference Based on Sample Retrieval, please refer to the [technical report](https://github.com/limix-ldm/LimiX/blob/main/LimiX_Technical_Report.pdf).

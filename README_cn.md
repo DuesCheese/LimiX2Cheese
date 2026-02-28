@@ -131,6 +131,10 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 | reg_default_noretrieval.json | 默认的**不含有retrieval**功能的**回归任务**推理配置文件 | 速度更快、显存需求更低 |
 | reg_default_noretrieval_MVI.json | 默认的**缺失值插补**任务推理配置文件 |  |
 
+
+## ➩ GUI 前端（LimiX2Cheese）
+GUI 使用说明见 [`doc/gui_usage_cn.md`](doc/gui_usage_cn.md)。
+
 ## ➩ 基于样本检索的ensemble推理
 基于样本检索的ensemble推理的详细技术描述详见[LimiX技术报告](https://github.com/limix-ldm/LimiX/blob/main/LimiX_Technical_Report.pdf)
 考虑到推理速度、显存占用，基于样本检索的ensemble推理目前只支持基于版本高于NVIDIA-RTX 4090显卡的硬件条件。
