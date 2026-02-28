@@ -1,0 +1,493 @@
+import json
+import importlib.util
+import logging
+import os
+import queue
+import subprocess
+import sys
+import threading
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+REQUIRED_PACKAGES = {
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "torch": "torch",
+    "sklearn": "scikit-learn",
+    "huggingface_hub": "huggingface-hub",
+}
+
+OPTIONAL_PACKAGES = {
+    "openpyxl": "openpyxl",
+    "xlrd": "xlrd",
+}
+
+
+@dataclass
+class RunConfig:
+    task: str
+    data_path: str
+    model_size: str
+    model_path: str
+    target_columns: List[str]
+    test_size: float
+    random_state: int
+    use_cpu: bool
+    use_retrieval: bool
+    local_output_dir: str
+
+
+class TkQueueHandler(logging.Handler):
+    def __init__(self, q: queue.Queue):
+        super().__init__()
+        self.q = q
+
+    def emit(self, record):
+        self.q.put(self.format(record))
+
+
+class LimiXGuiApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("LimiX2Cheese - 简易推理前端")
+        self.root.geometry("1120x760")
+
+        self.log_queue = queue.Queue()
+        self.logger = logging.getLogger("limix_gui")
+        self.logger.setLevel(logging.INFO)
+
+        self.log_file_path = None
+        self.worker_thread = None
+        self.stop_requested = False
+
+        self.dataframe = None
+        self.current_columns: List[str] = []
+
+        self._build_ui()
+        self._setup_logger()
+        self._poll_log_queue()
+
+    def _build_ui(self):
+        top = ttk.Frame(self.root, padding=10)
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="数据文件:").grid(row=0, column=0, sticky=tk.W)
+        self.data_path_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.data_path_var, width=85).grid(row=0, column=1, padx=5)
+        ttk.Button(top, text="选择 CSV/XLSX", command=self.select_data_file).grid(row=0, column=2)
+
+        ttk.Label(top, text="任务:").grid(row=1, column=0, sticky=tk.W, pady=8)
+        self.task_var = tk.StringVar(value="Classification")
+        task_box = ttk.Combobox(top, textvariable=self.task_var, state="readonly", values=["Classification", "Regression", "Missing Value Imputation"], width=35)
+        task_box.grid(row=1, column=1, sticky=tk.W)
+        task_box.bind("<<ComboboxSelected>>", lambda _: self.update_target_visibility())
+
+        ttk.Label(top, text="模型大小:").grid(row=1, column=1, sticky=tk.E)
+        self.model_size_var = tk.StringVar(value="16M")
+        ttk.Combobox(top, textvariable=self.model_size_var, state="readonly", values=["16M", "2M"], width=10).grid(row=1, column=2, sticky=tk.W)
+
+        model_frame = ttk.LabelFrame(self.root, text="模型与运行配置", padding=10)
+        model_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(model_frame, text="模型文件(.ckpt，可选):").grid(row=0, column=0, sticky=tk.W)
+        self.model_path_var = tk.StringVar()
+        ttk.Entry(model_frame, textvariable=self.model_path_var, width=78).grid(row=0, column=1, padx=5)
+        ttk.Button(model_frame, text="选择模型", command=self.select_model_file).grid(row=0, column=2)
+
+        self.use_cpu_var = tk.BooleanVar(value=False)
+        self.use_retrieval_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(model_frame, text="强制 CPU", variable=self.use_cpu_var).grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Checkbutton(model_frame, text="开启 Retrieval (需较强显卡)", variable=self.use_retrieval_var).grid(row=1, column=1, sticky=tk.W)
+
+        ttk.Label(model_frame, text="测试集比例:").grid(row=2, column=0, sticky=tk.W)
+        self.test_size_var = tk.StringVar(value="0.2")
+        ttk.Entry(model_frame, textvariable=self.test_size_var, width=10).grid(row=2, column=1, sticky=tk.W)
+
+        ttk.Label(model_frame, text="随机种子:").grid(row=2, column=1, sticky=tk.E)
+        self.seed_var = tk.StringVar(value="42")
+        ttk.Entry(model_frame, textvariable=self.seed_var, width=10).grid(row=2, column=2, sticky=tk.W)
+
+        ttk.Label(model_frame, text="输出目录:").grid(row=3, column=0, sticky=tk.W)
+        self.output_dir_var = tk.StringVar(value="./outputs")
+        ttk.Entry(model_frame, textvariable=self.output_dir_var, width=78).grid(row=3, column=1, padx=5)
+        ttk.Button(model_frame, text="选择目录", command=self.select_output_dir).grid(row=3, column=2)
+
+        target_frame = ttk.LabelFrame(self.root, text="目标列选择（分类/回归）", padding=10)
+        target_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=5)
+
+        self.target_hint = ttk.Label(target_frame, text="请选择需要预测的列。分类建议选 1 列，回归支持多列。")
+        self.target_hint.pack(anchor=tk.W)
+
+        list_frame = ttk.Frame(target_frame)
+        list_frame.pack(fill=tk.BOTH, expand=False)
+        self.target_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=8)
+        self.target_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.target_listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.target_listbox.config(yscrollcommand=scrollbar.set)
+
+        actions = ttk.Frame(self.root, padding=10)
+        actions.pack(fill=tk.X)
+        ttk.Button(actions, text="1) 检测依赖", command=self.check_dependencies).pack(side=tk.LEFT)
+        ttk.Button(actions, text="2) 自动安装缺失依赖", command=self.install_missing_dependencies).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="3) 开始推理", command=self.start_run).pack(side=tk.LEFT)
+
+        self.progress = ttk.Progressbar(actions, mode="determinate", length=260)
+        self.progress.pack(side=tk.LEFT, padx=10)
+
+        self.status_var = tk.StringVar(value="状态: 就绪")
+        ttk.Label(actions, textvariable=self.status_var).pack(side=tk.LEFT)
+
+        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.log_text = tk.Text(log_frame, height=20)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def _setup_logger(self):
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        handler = TkQueueHandler(self.log_queue)
+        handler.setFormatter(formatter)
+        if not self.logger.handlers:
+            self.logger.addHandler(handler)
+
+    def _set_progress(self, value: int, message: str = None):
+        self.progress["value"] = value
+        if message:
+            self.status_var.set(f"状态: {message}")
+
+    def _poll_log_queue(self):
+        while True:
+            try:
+                msg = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+        self.root.after(120, self._poll_log_queue)
+
+    def log(self, msg: str):
+        self.logger.info(msg)
+
+    def select_data_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Tabular files", "*.csv *.xlsx *.xls"), ("All files", "*.*")])
+        if file_path:
+            self.data_path_var.set(file_path)
+            self.load_columns(file_path)
+
+    def select_model_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Checkpoint", "*.ckpt"), ("All files", "*.*")])
+        if file_path:
+            self.model_path_var.set(file_path)
+
+    def select_output_dir(self):
+        directory = filedialog.askdirectory()
+        if directory:
+            self.output_dir_var.set(directory)
+
+    def load_columns(self, file_path: str):
+        try:
+            df = self._read_table_file(file_path)
+            self.dataframe = df
+            self.current_columns = list(df.columns)
+            self.target_listbox.delete(0, tk.END)
+            for c in self.current_columns:
+                self.target_listbox.insert(tk.END, c)
+            self.log(f"已加载数据文件: {file_path}, 行数={len(df)}, 列数={len(df.columns)}")
+        except Exception as exc:
+            messagebox.showerror("读取失败", f"读取文件失败: {exc}")
+            self.log(f"读取文件失败: {exc}")
+
+    def update_target_visibility(self):
+        task = self.task_var.get()
+        if task == "Missing Value Imputation":
+            self.target_hint.configure(text="缺失值插补任务不需要目标列。")
+        elif task == "Classification":
+            self.target_hint.configure(text="分类任务建议只选择 1 个目标列。")
+        else:
+            self.target_hint.configure(text="回归任务可多选目标列，多列时会逐列输出预测。")
+
+    def _missing_packages(self) -> Tuple[List[str], List[str]]:
+        missing_required, missing_optional = [], []
+        for mod, pip_name in REQUIRED_PACKAGES.items():
+            try:
+                __import__(mod)
+            except Exception:
+                missing_required.append(pip_name)
+        for mod, pip_name in OPTIONAL_PACKAGES.items():
+            try:
+                __import__(mod)
+            except Exception:
+                missing_optional.append(pip_name)
+
+        if importlib.util.find_spec("openpyxl") is None and importlib.util.find_spec("xlrd") is None:
+            if "openpyxl" not in missing_optional:
+                missing_optional.append("openpyxl")
+        return missing_required, missing_optional
+
+    def _read_table_file(self, file_path: str):
+        import pandas as pd
+
+        if file_path.lower().endswith(".csv"):
+            return pd.read_csv(file_path)
+        try:
+            return pd.read_excel(file_path)
+        except ImportError as exc:
+            raise ImportError(
+                "读取 Excel 失败：当前 Python 解释器缺少 Excel 引擎依赖。"
+                f"\n当前解释器: {sys.executable}"
+                "\n请在同一个解释器环境安装 openpyxl（.xlsx）或 xlrd（.xls），例如："
+                "python -m pip install openpyxl"
+            ) from exc
+
+    def check_dependencies(self):
+        missing_required, missing_optional = self._missing_packages()
+        if not missing_required and not missing_optional:
+            messagebox.showinfo("依赖检查", "依赖完整，可以运行。")
+            self.log("依赖检查完成: 全部已安装")
+            return
+
+        msg = []
+        if missing_required:
+            msg.append("缺失必需依赖: " + ", ".join(missing_required))
+        if missing_optional:
+            msg.append("缺失可选依赖: " + ", ".join(missing_optional))
+        text = "\n".join(msg)
+        messagebox.showwarning("依赖检查结果", text)
+        self.log(text)
+
+    def install_missing_dependencies(self):
+        missing_required, missing_optional = self._missing_packages()
+        packages = list(dict.fromkeys(missing_required + missing_optional))
+        if not packages:
+            self.log("无需安装依赖")
+            messagebox.showinfo("安装依赖", "没有缺失依赖。")
+            return
+
+        self.log(f"开始安装依赖: {packages}")
+        cmd = [sys.executable, "-m", "pip", "install", *packages]
+        try:
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            self.log(result.stdout)
+            if result.returncode != 0:
+                self.log(result.stderr)
+                messagebox.showerror("安装失败", f"安装依赖失败，退出码={result.returncode}\n{result.stderr[:500]}")
+            else:
+                messagebox.showinfo("安装依赖", "依赖安装成功。")
+        except Exception as exc:
+            self.log(f"安装依赖异常: {exc}")
+            messagebox.showerror("安装失败", str(exc))
+
+    def get_selected_targets(self) -> List[str]:
+        selected = [self.target_listbox.get(i) for i in self.target_listbox.curselection()]
+        return selected
+
+    def _prepare_run_config(self) -> RunConfig:
+        data_path = self.data_path_var.get().strip()
+        if not data_path:
+            raise ValueError("请先选择数据文件")
+        task = self.task_var.get().strip()
+        model_size = self.model_size_var.get().strip()
+        model_path = self.model_path_var.get().strip()
+        targets = self.get_selected_targets()
+
+        if task in ("Classification", "Regression") and not targets:
+            raise ValueError("分类/回归任务请至少选择一个目标列")
+        if task == "Classification" and len(targets) > 1:
+            self.log("提示: 分类任务选了多列，将使用第一个目标列。")
+            targets = [targets[0]]
+
+        test_size = float(self.test_size_var.get().strip())
+        if not 0.05 <= test_size <= 0.8:
+            raise ValueError("测试集比例建议在 0.05 ~ 0.8")
+        random_state = int(self.seed_var.get().strip())
+
+        out_dir = self.output_dir_var.get().strip() or "./outputs"
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        return RunConfig(
+            task=task,
+            data_path=data_path,
+            model_size=model_size,
+            model_path=model_path,
+            target_columns=targets,
+            test_size=test_size,
+            random_state=random_state,
+            use_cpu=bool(self.use_cpu_var.get()),
+            use_retrieval=bool(self.use_retrieval_var.get()),
+            local_output_dir=out_dir,
+        )
+
+    def start_run(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("运行中", "当前任务仍在运行，请稍后。")
+            return
+        try:
+            run_cfg = self._prepare_run_config()
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file_path = os.path.join(run_cfg.local_output_dir, f"run_{now}.log")
+        file_handler = logging.FileHandler(self.log_file_path, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        self.logger.addHandler(file_handler)
+
+        self.log("=" * 80)
+        self.log(f"任务开始，参数: {run_cfg}")
+
+        self.progress["value"] = 0
+        self.worker_thread = threading.Thread(target=self._run_pipeline_thread, args=(run_cfg, file_handler), daemon=True)
+        self.worker_thread.start()
+
+    def _run_pipeline_thread(self, run_cfg: RunConfig, file_handler: logging.FileHandler):
+        try:
+            self.root.after(0, lambda: self._set_progress(5, "加载依赖"))
+            import numpy as np
+            import pandas as pd
+            import torch
+            from huggingface_hub import hf_hub_download
+            from sklearn.model_selection import train_test_split
+            from sklearn.preprocessing import LabelEncoder
+
+            from inference.predictor import LimiXPredictor
+
+            self.root.after(0, lambda: self._set_progress(15, "加载数据"))
+            df = self._read_table_file(run_cfg.data_path)
+
+            self.log(f"数据加载完成: shape={df.shape}")
+
+            self.root.after(0, lambda: self._set_progress(28, "数据预处理"))
+
+            if run_cfg.task == "Missing Value Imputation":
+                target_col = None
+                x_df = df.copy()
+                y = np.zeros((len(df),), dtype=np.int64)
+            else:
+                target_col = run_cfg.target_columns[0]
+                y = df[target_col]
+                x_df = df.drop(columns=run_cfg.target_columns)
+
+            x_df = x_df.copy()
+            for col in x_df.columns:
+                if x_df[col].dtype == "object":
+                    x_df[col] = x_df[col].astype("category").cat.codes.replace(-1, np.nan)
+
+            x = np.asarray(x_df, dtype=np.float32)
+
+            if run_cfg.task == "Classification":
+                y = LabelEncoder().fit_transform(y.fillna("__NA__"))
+                y = np.asarray(y, dtype=np.int64)
+            elif run_cfg.task == "Regression":
+                y = np.asarray(y, dtype=np.float32)
+            else:
+                y = np.asarray(y, dtype=np.int64)
+
+            x_train, x_test, y_train, y_test = train_test_split(
+                x, y, test_size=run_cfg.test_size, random_state=run_cfg.random_state
+            )
+
+            self.root.after(0, lambda: self._set_progress(45, "准备模型"))
+
+            use_cuda = torch.cuda.is_available() and not run_cfg.use_cpu
+            device = torch.device("cuda" if use_cuda else "cpu")
+
+            if run_cfg.model_path:
+                model_path = run_cfg.model_path
+            else:
+                repo_id = "stableai-org/LimiX-16M" if run_cfg.model_size == "16M" else "stableai-org/LimiX-2M"
+                filename = "LimiX-16M.ckpt" if run_cfg.model_size == "16M" else "LimiX-2M.ckpt"
+                self.log(f"未指定本地模型，开始下载: {repo_id}/{filename}")
+                model_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir="./cache")
+
+            if run_cfg.task == "Classification":
+                config_name = "config/cls_default_16M_retrieval.json" if run_cfg.use_retrieval else "config/cls_default_noretrieval.json"
+            elif run_cfg.task == "Regression":
+                config_name = "config/reg_default_16M_retrieval.json" if run_cfg.use_retrieval else "config/reg_default_noretrieval.json"
+            else:
+                config_name = "config/reg_default_noretrieval_MVI.json"
+
+            if run_cfg.model_size == "2M" and run_cfg.task != "Missing Value Imputation":
+                config_name = (
+                    "config/cls_default_2M_retrieval.json" if run_cfg.task == "Classification" and run_cfg.use_retrieval
+                    else "config/reg_default_2M_retrieval.json" if run_cfg.task == "Regression" and run_cfg.use_retrieval
+                    else "config/cls_default_noretrieval.json" if run_cfg.task == "Classification"
+                    else "config/reg_default_noretrieval.json"
+                )
+
+            if device.type == "cpu" and "retrieval" in config_name and "noretrieval" not in config_name:
+                self.log("CPU 不支持 retrieval，自动切换 noretrieval 配置")
+                config_name = "config/cls_default_noretrieval.json" if run_cfg.task == "Classification" else "config/reg_default_noretrieval.json"
+
+            self.log(f"使用设备={device}, config={config_name}, model={model_path}")
+
+            self.root.after(0, lambda: self._set_progress(65, "模型推理"))
+            predictor = LimiXPredictor(
+                device=device,
+                model_path=model_path,
+                inference_config=config_name,
+                mask_prediction=(run_cfg.task == "Missing Value Imputation"),
+            )
+
+            if run_cfg.task == "Missing Value Imputation":
+                pred, reconstructed = predictor.predict(x_train, y_train, x_test, task_type="Regression")
+                pred_values = reconstructed[-x_test.shape[0]:]
+            else:
+                pred = predictor.predict(x_train, y_train, x_test, task_type=run_cfg.task)
+                if hasattr(pred, "detach"):
+                    pred = pred.detach().cpu().numpy()
+                elif hasattr(pred, "to"):
+                    pred = pred.to("cpu").numpy()
+                pred_values = pred
+
+            self.root.after(0, lambda: self._set_progress(86, "保存结果"))
+            out_base = Path(run_cfg.local_output_dir)
+            now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pred_path = out_base / f"prediction_{run_cfg.task.replace(' ', '_')}_{now}.csv"
+
+            if run_cfg.task == "Classification":
+                pred_df = pd.DataFrame(pred_values)
+                pred_df.insert(0, "pred_label", pred_df.values.argmax(axis=1))
+            elif run_cfg.task == "Regression":
+                pred_df = pd.DataFrame(pred_values if pred_values.ndim > 1 else pred_values.reshape(-1, 1), columns=[f"pred_{c}" for c in run_cfg.target_columns[:1]])
+            else:
+                pred_df = pd.DataFrame(pred_values, columns=x_df.columns)
+
+            pred_df.to_csv(pred_path, index=False)
+
+            meta_path = out_base / f"run_meta_{now}.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(run_cfg.__dict__, f, ensure_ascii=False, indent=2)
+
+            self.log(f"推理完成，结果已保存: {pred_path}")
+            self.log(f"日志文件: {self.log_file_path}")
+            self.root.after(0, lambda: self._set_progress(100, "完成"))
+            self.root.after(0, lambda: messagebox.showinfo("完成", f"推理完成!\n输出: {pred_path}\n日志: {self.log_file_path}"))
+
+        except Exception as exc:
+            self.log(f"运行失败: {exc}")
+            self.log(traceback.format_exc())
+            self.root.after(0, lambda: self._set_progress(0, "失败"))
+            self.root.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
+        finally:
+            self.logger.removeHandler(file_handler)
+            file_handler.close()
+
+
+def main():
+    root = tk.Tk()
+    app = LimiXGuiApp(root)
+    app.log(f"Python 解释器: {sys.executable}")
+    app.log("欢迎使用 LimiX2Cheese GUI。建议顺序：检测依赖 -> 选择文件与任务 -> 开始推理")
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

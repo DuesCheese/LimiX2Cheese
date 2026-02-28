@@ -131,6 +131,42 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 | reg_default_noretrieval.json | 默认的**不含有retrieval**功能的**回归任务**推理配置文件 | 速度更快、显存需求更低 |
 | reg_default_noretrieval_MVI.json | 默认的**缺失值插补**任务推理配置文件 |  |
 
+
+## ➩ GUI 前端（LimiX2Cheese）
+项目新增了一个简易桌面前端 `limix_gui.py`，可用于“一键式”执行分类、回归和缺失值插补推理。
+
+### 功能
+- 自动检测缺失依赖（可一键安装）
+- 选择输入文件（`csv/xlsx/xls`）
+- 选择任务（分类 / 回归 / 缺失值插补）
+- 选择模型（本地 `.ckpt` 或自动从 HuggingFace 下载）
+- 回归任务支持目标列选择（多选）
+- 进度条与实时日志
+- 运行结束后自动导出预测结果 `csv`、运行元数据 `json`、日志 `log`
+
+### 启动方式
+```bash
+python limix_gui.py
+# 或 Linux/macOS
+./run_gui.sh
+# 或 Windows 双击
+run_gui.bat
+```
+
+### 打包 exe（可选）
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name LimiX2Cheese-GUI limix_gui.py
+```
+打包后的可执行文件位于 `dist/LimiX2Cheese-GUI(.exe)`。
+
+### 常见问题：明明装了依赖，GUI 仍提示缺少 Excel 库
+这通常是因为 **运行 GUI 的 Python 解释器** 与你安装依赖的解释器不是同一个。
+请先查看 GUI 日志中的 `Python 解释器: ...`，然后在同一解释器下安装：
+```bash
+python -m pip install openpyxl
+```
+
 ## ➩ 基于样本检索的ensemble推理
 基于样本检索的ensemble推理的详细技术描述详见[LimiX技术报告](https://github.com/limix-ldm/LimiX/blob/main/LimiX_Technical_Report.pdf)
 考虑到推理速度、显存占用，基于样本检索的ensemble推理目前只支持基于版本高于NVIDIA-RTX 4090显卡的硬件条件。
