@@ -32,6 +32,7 @@ OPTIONAL_PACKAGES = {
 class RunConfig:
     task: str
     data_path: str
+    predict_data_path: str
     model_size: str
     model_path: str
     target_columns: List[str]
@@ -81,15 +82,20 @@ class LimiXGuiApp:
         ttk.Entry(top, textvariable=self.data_path_var, width=85).grid(row=0, column=1, padx=5)
         ttk.Button(top, text="选择 CSV/XLSX", command=self.select_data_file).grid(row=0, column=2)
 
-        ttk.Label(top, text="任务:").grid(row=1, column=0, sticky=tk.W, pady=8)
+        ttk.Label(top, text="预测文件(可选):").grid(row=1, column=0, sticky=tk.W)
+        self.predict_data_path_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.predict_data_path_var, width=85).grid(row=1, column=1, padx=5)
+        ttk.Button(top, text="选择预测文件", command=self.select_predict_file).grid(row=1, column=2)
+
+        ttk.Label(top, text="任务:").grid(row=2, column=0, sticky=tk.W, pady=8)
         self.task_var = tk.StringVar(value="Classification")
         task_box = ttk.Combobox(top, textvariable=self.task_var, state="readonly", values=["Classification", "Regression", "Missing Value Imputation"], width=35)
-        task_box.grid(row=1, column=1, sticky=tk.W)
+        task_box.grid(row=2, column=1, sticky=tk.W)
         task_box.bind("<<ComboboxSelected>>", lambda _: self.update_target_visibility())
 
-        ttk.Label(top, text="模型大小:").grid(row=1, column=1, sticky=tk.E)
+        ttk.Label(top, text="模型大小:").grid(row=2, column=1, sticky=tk.E)
         self.model_size_var = tk.StringVar(value="16M")
-        ttk.Combobox(top, textvariable=self.model_size_var, state="readonly", values=["16M", "2M"], width=10).grid(row=1, column=2, sticky=tk.W)
+        ttk.Combobox(top, textvariable=self.model_size_var, state="readonly", values=["16M", "2M"], width=10).grid(row=2, column=2, sticky=tk.W)
 
         model_frame = ttk.LabelFrame(self.root, text="模型与运行配置", padding=10)
         model_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -184,6 +190,11 @@ class LimiXGuiApp:
         if file_path:
             self.model_path_var.set(file_path)
 
+    def select_predict_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Tabular files", "*.csv *.xlsx *.xls"), ("All files", "*.*")])
+        if file_path:
+            self.predict_data_path_var.set(file_path)
+
     def select_output_dir(self):
         directory = filedialog.askdirectory()
         if directory:
@@ -274,6 +285,7 @@ class LimiXGuiApp:
 
     def _prepare_run_config(self) -> RunConfig:
         data_path = self.data_path_var.get().strip()
+        predict_data_path = self.predict_data_path_var.get().strip()
         if not data_path:
             raise ValueError("请先选择数据文件")
         task = self.task_var.get().strip()
@@ -298,6 +310,7 @@ class LimiXGuiApp:
         return RunConfig(
             task=task,
             data_path=data_path,
+            predict_data_path=predict_data_path,
             model_size=model_size,
             model_path=model_path,
             target_columns=targets,
@@ -349,37 +362,82 @@ class LimiXGuiApp:
             else:
                 df = pd.read_excel(run_cfg.data_path)
 
+            predict_df = None
+            if run_cfg.predict_data_path:
+                if run_cfg.predict_data_path.lower().endswith(".csv"):
+                    predict_df = pd.read_csv(run_cfg.predict_data_path)
+                else:
+                    predict_df = pd.read_excel(run_cfg.predict_data_path)
+
             self.log(f"数据加载完成: shape={df.shape}")
 
             self.root.after(0, lambda: self._set_progress(28, "数据预处理"))
 
+            def _encode_features(feature_df, fit_info=None):
+                work_df = feature_df.copy()
+                if fit_info is None:
+                    fit_info = {"datetime": {}, "category": {}}
+                    fit_mode = True
+                else:
+                    fit_mode = False
+
+                for col in work_df.columns:
+                    if fit_mode:
+                        parsed = pd.to_datetime(work_df[col], errors="coerce") if work_df[col].dtype in ["object", "string"] else None
+                        if parsed is not None and parsed.notna().mean() > 0.8:
+                            fit_info["datetime"][col] = True
+                    if col in fit_info["datetime"]:
+                        parsed = pd.to_datetime(work_df[col], errors="coerce")
+                        work_df[f"{col}__year"] = parsed.dt.year
+                        work_df[f"{col}__month"] = parsed.dt.month
+                        work_df[f"{col}__day"] = parsed.dt.day
+                        work_df[f"{col}__dayofweek"] = parsed.dt.dayofweek
+                        work_df[f"{col}__timestamp"] = parsed.astype("int64") / 1e9
+                        work_df = work_df.drop(columns=[col])
+
+                for col in work_df.columns:
+                    if work_df[col].dtype in ["object", "string", "category", "bool"]:
+                        if fit_mode:
+                            categories = pd.Series(work_df[col].astype("string").dropna().unique()).tolist()
+                            fit_info["category"][col] = {v: i for i, v in enumerate(categories)}
+                        mapping = fit_info["category"].get(col, {})
+                        work_df[col] = work_df[col].astype("string").map(mapping)
+
+                return np.asarray(work_df, dtype=np.float32), fit_info, work_df.columns.tolist()
+
             if run_cfg.task == "Missing Value Imputation":
-                target_col = None
-                x_df = df.copy()
-                y = np.zeros((len(df),), dtype=np.int64)
+                feature_train_df = df[~df.isna().any(axis=1)].copy()
+                feature_test_df = predict_df.copy() if predict_df is not None else df[df.isna().any(axis=1)].copy()
+                if feature_test_df.empty:
+                    raise ValueError("未找到待插补样本。请在数据中保留空值，或提供预测文件。")
+                y_train = np.zeros((len(feature_train_df),), dtype=np.int64)
             else:
                 target_col = run_cfg.target_columns[0]
-                y = df[target_col]
-                x_df = df.drop(columns=run_cfg.target_columns)
+                feature_cols = [c for c in df.columns if c not in run_cfg.target_columns]
+                train_df = df[df[target_col].notna()].copy()
+                y_raw = train_df[target_col]
+                feature_train_df = train_df[feature_cols]
 
-            x_df = x_df.copy()
-            for col in x_df.columns:
-                if x_df[col].dtype == "object":
-                    x_df[col] = x_df[col].astype("category").cat.codes.replace(-1, np.nan)
+                if predict_df is not None:
+                    feature_test_df = predict_df[feature_cols].copy()
+                else:
+                    missing_target_df = df[df[target_col].isna()].copy()
+                    if not missing_target_df.empty:
+                        feature_test_df = missing_target_df[feature_cols]
+                    else:
+                        train_part, test_part = train_test_split(train_df, test_size=run_cfg.test_size, random_state=run_cfg.random_state)
+                        feature_train_df = train_part[feature_cols]
+                        y_raw = train_part[target_col]
+                        feature_test_df = test_part[feature_cols]
 
-            x = np.asarray(x_df, dtype=np.float32)
+                if run_cfg.task == "Classification":
+                    y_train = LabelEncoder().fit_transform(y_raw.fillna("__NA__"))
+                    y_train = np.asarray(y_train, dtype=np.int64)
+                else:
+                    y_train = np.asarray(y_raw, dtype=np.float32)
 
-            if run_cfg.task == "Classification":
-                y = LabelEncoder().fit_transform(y.fillna("__NA__"))
-                y = np.asarray(y, dtype=np.int64)
-            elif run_cfg.task == "Regression":
-                y = np.asarray(y, dtype=np.float32)
-            else:
-                y = np.asarray(y, dtype=np.int64)
-
-            x_train, x_test, y_train, y_test = train_test_split(
-                x, y, test_size=run_cfg.test_size, random_state=run_cfg.random_state
-            )
+            x_train, encoder_info, encoded_cols = _encode_features(feature_train_df)
+            x_test, _, _ = _encode_features(feature_test_df, encoder_info)
 
             self.root.after(0, lambda: self._set_progress(45, "准备模型"))
 
@@ -443,9 +501,26 @@ class LimiXGuiApp:
                 pred_df = pd.DataFrame(pred_values)
                 pred_df.insert(0, "pred_label", pred_df.values.argmax(axis=1))
             elif run_cfg.task == "Regression":
-                pred_df = pd.DataFrame(pred_values if pred_values.ndim > 1 else pred_values.reshape(-1, 1), columns=[f"pred_{c}" for c in run_cfg.target_columns[:1]])
+                pred_df = feature_test_df.reset_index(drop=True).copy()
+                pred_df[f"pred_{run_cfg.target_columns[0]}"] = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+
+                importances = []
+                x_imp = np.nan_to_num(x_train.copy(), nan=np.nanmean(x_train, axis=0))
+                x_std = np.std(x_imp, axis=0)
+                x_std[x_std == 0] = 1.0
+                x_norm = (x_imp - np.mean(x_imp, axis=0)) / x_std
+                y_center = y_train - np.mean(y_train)
+                coeff = x_norm.T @ y_center / max(len(y_center) - 1, 1)
+                for idx, name in enumerate(encoded_cols):
+                    importances.append({"feature": name, "impact": float(coeff[idx])})
+                pd.DataFrame(importances).sort_values("impact").to_csv(out_base / f"feature_impact_{now}.csv", index=False)
             else:
-                pred_df = pd.DataFrame(pred_values, columns=x_df.columns)
+                imputed = pd.DataFrame(pred_values, columns=feature_train_df.columns)
+                base = feature_test_df.reset_index(drop=True).copy()
+                for col in base.columns:
+                    if base[col].isna().any():
+                        base[col] = base[col].fillna(imputed[col])
+                pred_df = base
 
             pred_df.to_csv(pred_path, index=False)
 
