@@ -373,6 +373,13 @@ class LimiXGuiApp:
 
             self.root.after(0, lambda: self._set_progress(28, "数据预处理"))
 
+            def _normalize_missing_values(frame):
+                cleaned = frame.copy()
+                text_cols = cleaned.select_dtypes(include=["object", "string"]).columns
+                if len(text_cols) > 0:
+                    cleaned[text_cols] = cleaned[text_cols].replace(r"^\s*$", np.nan, regex=True)
+                return cleaned
+
             def _encode_features(feature_df, fit_info=None):
                 work_df = feature_df.copy()
                 if fit_info is None:
@@ -406,12 +413,14 @@ class LimiXGuiApp:
                 return np.asarray(work_df, dtype=np.float32), fit_info, work_df.columns.tolist()
 
             if run_cfg.task == "Missing Value Imputation":
-                feature_train_df = df[~df.isna().any(axis=1)].copy()
-                feature_test_df = predict_df.copy() if predict_df is not None else df[df.isna().any(axis=1)].copy()
+                source_df = _normalize_missing_values(df)
+                feature_train_df = source_df[~source_df.isna().any(axis=1)].copy()
+                feature_test_df = _normalize_missing_values(predict_df) if predict_df is not None else source_df[source_df.isna().any(axis=1)].copy()
                 if feature_test_df.empty:
                     raise ValueError("未找到待插补样本。请在数据中保留空值，或提供预测文件。")
                 y_train = np.zeros((len(feature_train_df),), dtype=np.int64)
             else:
+                df = _normalize_missing_values(df)
                 target_col = run_cfg.target_columns[0]
                 feature_cols = [c for c in df.columns if c not in run_cfg.target_columns]
                 train_df = df[df[target_col].notna()].copy()
@@ -419,7 +428,7 @@ class LimiXGuiApp:
                 feature_train_df = train_df[feature_cols]
 
                 if predict_df is not None:
-                    feature_test_df = predict_df[feature_cols].copy()
+                    feature_test_df = _normalize_missing_values(predict_df)[feature_cols].copy()
                 else:
                     missing_target_df = df[df[target_col].isna()].copy()
                     if not missing_target_df.empty:
@@ -506,14 +515,45 @@ class LimiXGuiApp:
 
                 importances = []
                 x_imp = np.nan_to_num(x_train.copy(), nan=np.nanmean(x_train, axis=0))
+                y_imp = np.nan_to_num(y_train.copy(), nan=np.nanmean(y_train))
                 x_std = np.std(x_imp, axis=0)
+                y_std = np.std(y_imp)
                 x_std[x_std == 0] = 1.0
+                y_std = y_std if y_std > 0 else 1.0
                 x_norm = (x_imp - np.mean(x_imp, axis=0)) / x_std
-                y_center = y_train - np.mean(y_train)
-                coeff = x_norm.T @ y_center / max(len(y_center) - 1, 1)
+                y_norm = (y_imp - np.mean(y_imp)) / y_std
+                coeff = (x_norm.T @ y_norm) / max(len(y_norm) - 1, 1)
                 for idx, name in enumerate(encoded_cols):
                     importances.append({"feature": name, "impact": float(coeff[idx])})
-                pd.DataFrame(importances).sort_values("impact").to_csv(out_base / f"feature_impact_{now}.csv", index=False)
+                pd.DataFrame(importances).sort_values("impact", key=lambda s: s.abs(), ascending=False).to_csv(
+                    out_base / f"feature_impact_{now}.csv", index=False
+                )
+
+                relation_rows = []
+                pred_array = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+                pred_std = float(np.std(pred_array))
+                pred_std = pred_std if pred_std > 0 else 1.0
+                pred_norm = (pred_array - np.mean(pred_array)) / pred_std
+                x_test_imp = np.nan_to_num(x_test.copy(), nan=np.nanmean(x_train, axis=0))
+                x_test_std = np.std(x_test_imp, axis=0)
+                x_test_std[x_test_std == 0] = 1.0
+                x_test_norm = (x_test_imp - np.mean(x_test_imp, axis=0)) / x_test_std
+                corr_with_pred = (x_test_norm.T @ pred_norm) / max(len(pred_norm) - 1, 1)
+
+                for idx, name in enumerate(encoded_cols):
+                    relation_rows.append(
+                        {
+                            "feature": name,
+                            "corr_with_target": float(coeff[idx]),
+                            "corr_with_prediction": float(corr_with_pred[idx]),
+                            "causal_hint": float(coeff[idx] * corr_with_pred[idx]),
+                        }
+                    )
+
+                pd.DataFrame(relation_rows).sort_values("causal_hint", key=lambda s: s.abs(), ascending=False).to_csv(
+                    out_base / f"feature_relation_{now}.csv", index=False
+                )
+                self.log(f"已输出特征相关性/因果线索: {out_base / f'feature_relation_{now}.csv'}")
             else:
                 imputed = pd.DataFrame(pred_values, columns=feature_train_df.columns)
                 base = feature_test_df.reset_index(drop=True).copy()
