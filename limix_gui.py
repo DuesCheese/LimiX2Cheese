@@ -380,6 +380,35 @@ class LimiXGuiApp:
                     cleaned[text_cols] = cleaned[text_cols].replace(r"^\s*$", np.nan, regex=True)
                 return cleaned
 
+            def _normalize_column_names(frame):
+                cleaned = frame.copy()
+                normalized_cols = cleaned.columns.astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+                if normalized_cols.duplicated().any():
+                    dup_cols = normalized_cols[normalized_cols.duplicated()].tolist()
+                    raise ValueError(f"检测到重复列名（规范化后）: {dup_cols}")
+                cleaned.columns = normalized_cols
+                return cleaned
+
+            def _align_columns(frame, expected_cols):
+                normalized = _normalize_column_names(frame)
+                col_lookup = {str(c).strip().casefold(): c for c in normalized.columns}
+                aligned = {}
+                missing = []
+                for col in expected_cols:
+                    key = str(col).strip().casefold()
+                    if key in col_lookup:
+                        aligned[col] = normalized[col_lookup[key]]
+                    else:
+                        missing.append(col)
+
+                if missing:
+                    raise ValueError(
+                        "预测文件缺少训练特征列: "
+                        + ", ".join(missing)
+                        + f"。可用列为: {list(normalized.columns)}"
+                    )
+                return pd.DataFrame(aligned)
+
             def _encode_features(feature_df, fit_info=None):
                 work_df = feature_df.copy()
                 if fit_info is None:
@@ -390,16 +419,21 @@ class LimiXGuiApp:
 
                 for col in work_df.columns:
                     if fit_mode:
-                        parsed = pd.to_datetime(work_df[col], errors="coerce") if work_df[col].dtype in ["object", "string"] else None
-                        if parsed is not None and parsed.notna().mean() > 0.8:
+                        if pd.api.types.is_datetime64_any_dtype(work_df[col]):
                             fit_info["datetime"][col] = True
+                        elif work_df[col].dtype in ["object", "string"]:
+                            parsed = pd.to_datetime(work_df[col], errors="coerce")
+                            if parsed.notna().mean() > 0.8:
+                                fit_info["datetime"][col] = True
                     if col in fit_info["datetime"]:
                         parsed = pd.to_datetime(work_df[col], errors="coerce")
                         work_df[f"{col}__year"] = parsed.dt.year
                         work_df[f"{col}__month"] = parsed.dt.month
                         work_df[f"{col}__day"] = parsed.dt.day
                         work_df[f"{col}__dayofweek"] = parsed.dt.dayofweek
-                        work_df[f"{col}__timestamp"] = parsed.astype("int64") / 1e9
+                        timestamp_vals = parsed.view("int64").astype("float64")
+                        timestamp_vals[timestamp_vals == np.iinfo(np.int64).min] = np.nan
+                        work_df[f"{col}__timestamp"] = timestamp_vals / 1e9
                         work_df = work_df.drop(columns=[col])
 
                 for col in work_df.columns:
@@ -413,14 +447,14 @@ class LimiXGuiApp:
                 return np.asarray(work_df, dtype=np.float32), fit_info, work_df.columns.tolist()
 
             if run_cfg.task == "Missing Value Imputation":
-                source_df = _normalize_missing_values(df)
+                source_df = _normalize_column_names(_normalize_missing_values(df))
                 feature_train_df = source_df[~source_df.isna().any(axis=1)].copy()
-                feature_test_df = _normalize_missing_values(predict_df) if predict_df is not None else source_df[source_df.isna().any(axis=1)].copy()
+                feature_test_df = _align_columns(_normalize_missing_values(predict_df), source_df.columns) if predict_df is not None else source_df[source_df.isna().any(axis=1)].copy()
                 if feature_test_df.empty:
                     raise ValueError("未找到待插补样本。请在数据中保留空值，或提供预测文件。")
                 y_train = np.zeros((len(feature_train_df),), dtype=np.int64)
             else:
-                df = _normalize_missing_values(df)
+                df = _normalize_column_names(_normalize_missing_values(df))
                 target_col = run_cfg.target_columns[0]
                 feature_cols = [c for c in df.columns if c not in run_cfg.target_columns]
                 train_df = df[df[target_col].notna()].copy()
@@ -428,7 +462,7 @@ class LimiXGuiApp:
                 feature_train_df = train_df[feature_cols]
 
                 if predict_df is not None:
-                    feature_test_df = _normalize_missing_values(predict_df)[feature_cols].copy()
+                    feature_test_df = _align_columns(_normalize_missing_values(predict_df), feature_cols).copy()
                 else:
                     missing_target_df = df[df[target_col].isna()].copy()
                     if not missing_target_df.empty:
@@ -586,7 +620,11 @@ class LimiXGuiApp:
                 base = feature_test_df.reset_index(drop=True).copy()
                 for col in base.columns:
                     if base[col].isna().any() and col in imputed.columns:
-                        base[col] = base[col].fillna(imputed[col])
+                        fill_values = imputed[col]
+                        if col in encoder_info.get("category", {}):
+                            inverse_mapping = {v: k for k, v in encoder_info["category"][col].items()}
+                            fill_values = pd.Series(fill_values).round().astype("Int64").map(inverse_mapping)
+                        base[col] = base[col].fillna(fill_values)
 
                 # 若模型插补后仍存在空值，则使用经典线性回归兜底插补，保证输出完整。
                 if base.isna().any().any():
