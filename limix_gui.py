@@ -373,6 +373,13 @@ class LimiXGuiApp:
 
             self.root.after(0, lambda: self._set_progress(28, "数据预处理"))
 
+            def _normalize_missing_values(frame):
+                cleaned = frame.copy()
+                text_cols = cleaned.select_dtypes(include=["object", "string"]).columns
+                if len(text_cols) > 0:
+                    cleaned[text_cols] = cleaned[text_cols].replace(r"^\s*$", np.nan, regex=True)
+                return cleaned
+
             def _encode_features(feature_df, fit_info=None):
                 work_df = feature_df.copy()
                 if fit_info is None:
@@ -406,12 +413,14 @@ class LimiXGuiApp:
                 return np.asarray(work_df, dtype=np.float32), fit_info, work_df.columns.tolist()
 
             if run_cfg.task == "Missing Value Imputation":
-                feature_train_df = df[~df.isna().any(axis=1)].copy()
-                feature_test_df = predict_df.copy() if predict_df is not None else df[df.isna().any(axis=1)].copy()
+                source_df = _normalize_missing_values(df)
+                feature_train_df = source_df[~source_df.isna().any(axis=1)].copy()
+                feature_test_df = _normalize_missing_values(predict_df) if predict_df is not None else source_df[source_df.isna().any(axis=1)].copy()
                 if feature_test_df.empty:
                     raise ValueError("未找到待插补样本。请在数据中保留空值，或提供预测文件。")
                 y_train = np.zeros((len(feature_train_df),), dtype=np.int64)
             else:
+                df = _normalize_missing_values(df)
                 target_col = run_cfg.target_columns[0]
                 feature_cols = [c for c in df.columns if c not in run_cfg.target_columns]
                 train_df = df[df[target_col].notna()].copy()
@@ -419,7 +428,7 @@ class LimiXGuiApp:
                 feature_train_df = train_df[feature_cols]
 
                 if predict_df is not None:
-                    feature_test_df = predict_df[feature_cols].copy()
+                    feature_test_df = _normalize_missing_values(predict_df)[feature_cols].copy()
                 else:
                     missing_target_df = df[df[target_col].isna()].copy()
                     if not missing_target_df.empty:
@@ -484,6 +493,8 @@ class LimiXGuiApp:
             if run_cfg.task == "Missing Value Imputation":
                 pred, reconstructed = predictor.predict(x_train, y_train, x_test, task_type="Regression")
                 pred_values = reconstructed[-x_test.shape[0]:]
+                if len(pred_values) != x_test.shape[0]:
+                    pred_values = pred_values[: x_test.shape[0]]
             else:
                 pred = predictor.predict(x_train, y_train, x_test, task_type=run_cfg.task)
                 if hasattr(pred, "detach"):
@@ -491,6 +502,9 @@ class LimiXGuiApp:
                 elif hasattr(pred, "to"):
                     pred = pred.to("cpu").numpy()
                 pred_values = pred
+                if getattr(pred_values, "shape", [0])[0] != x_test.shape[0]:
+                    self.log(f"模型输出行数({getattr(pred_values, 'shape', [0])[0]})与预测样本数({x_test.shape[0]})不一致，截断到预测样本数。")
+                    pred_values = pred_values[: x_test.shape[0]]
 
             self.root.after(0, lambda: self._set_progress(86, "保存结果"))
             out_base = Path(run_cfg.local_output_dir)
@@ -502,24 +516,99 @@ class LimiXGuiApp:
                 pred_df.insert(0, "pred_label", pred_df.values.argmax(axis=1))
             elif run_cfg.task == "Regression":
                 pred_df = feature_test_df.reset_index(drop=True).copy()
-                pred_df[f"pred_{run_cfg.target_columns[0]}"] = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+                pred_col_name = f"pred_{run_cfg.target_columns[0]}"
+                pred_df[pred_col_name] = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+
+                # 小样本、单特征的数值回归场景，优先给出线性回归兜底结果，避免基础模型在外推时出现量纲偏移。
+                if feature_train_df.shape[1] >= 1 and len(feature_train_df) >= 5:
+                    try:
+                        from sklearn.linear_model import LinearRegression
+
+                        x_lr_train = feature_train_df.apply(pd.to_numeric, errors="coerce")
+                        x_lr_test = feature_test_df.apply(pd.to_numeric, errors="coerce")
+                        y_lr_train = pd.Series(y_train).astype(float)
+                        valid_mask = (~x_lr_train.isna().any(axis=1)) & y_lr_train.notna()
+                        if valid_mask.sum() >= 5 and not x_lr_test.isna().any().any():
+                            lr_model = LinearRegression()
+                            lr_model.fit(x_lr_train.loc[valid_mask], y_lr_train.loc[valid_mask])
+                            lr_pred = lr_model.predict(x_lr_test)
+                            limix_span = float(np.nanmax(pred_df[pred_col_name]) - np.nanmin(pred_df[pred_col_name])) if len(pred_df) else 0.0
+                            lr_span = float(np.nanmax(lr_pred) - np.nanmin(lr_pred)) if len(lr_pred) else 0.0
+                            if limix_span < 0.5 * lr_span:
+                                self.log("检测到深度模型回归外推幅度明显偏小，已采用线性回归兜底预测结果。")
+                                pred_df[pred_col_name] = lr_pred
+                    except Exception as lr_exc:
+                        self.log(f"线性回归兜底未生效: {lr_exc}")
 
                 importances = []
                 x_imp = np.nan_to_num(x_train.copy(), nan=np.nanmean(x_train, axis=0))
+                y_imp = np.nan_to_num(y_train.copy(), nan=np.nanmean(y_train))
                 x_std = np.std(x_imp, axis=0)
+                y_std = np.std(y_imp)
                 x_std[x_std == 0] = 1.0
+                y_std = y_std if y_std > 0 else 1.0
                 x_norm = (x_imp - np.mean(x_imp, axis=0)) / x_std
-                y_center = y_train - np.mean(y_train)
-                coeff = x_norm.T @ y_center / max(len(y_center) - 1, 1)
+                y_norm = (y_imp - np.mean(y_imp)) / y_std
+                coeff = (x_norm.T @ y_norm) / max(len(y_norm) - 1, 1)
                 for idx, name in enumerate(encoded_cols):
                     importances.append({"feature": name, "impact": float(coeff[idx])})
-                pd.DataFrame(importances).sort_values("impact").to_csv(out_base / f"feature_impact_{now}.csv", index=False)
+                pd.DataFrame(importances).sort_values("impact", key=lambda s: s.abs(), ascending=False).to_csv(
+                    out_base / f"feature_impact_{now}.csv", index=False
+                )
+
+                relation_rows = []
+                pred_array = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+                pred_std = float(np.std(pred_array))
+                pred_std = pred_std if pred_std > 0 else 1.0
+                pred_norm = (pred_array - np.mean(pred_array)) / pred_std
+                x_test_imp = np.nan_to_num(x_test.copy(), nan=np.nanmean(x_train, axis=0))
+                x_test_std = np.std(x_test_imp, axis=0)
+                x_test_std[x_test_std == 0] = 1.0
+                x_test_norm = (x_test_imp - np.mean(x_test_imp, axis=0)) / x_test_std
+                corr_with_pred = (x_test_norm.T @ pred_norm) / max(len(pred_norm) - 1, 1)
+
+                for idx, name in enumerate(encoded_cols):
+                    relation_rows.append(
+                        {
+                            "feature": name,
+                            "corr_with_target": float(coeff[idx]),
+                            "corr_with_prediction": float(corr_with_pred[idx]),
+                            "causal_hint": float(coeff[idx] * corr_with_pred[idx]),
+                        }
+                    )
+
+                pd.DataFrame(relation_rows).sort_values("causal_hint", key=lambda s: s.abs(), ascending=False).to_csv(
+                    out_base / f"feature_relation_{now}.csv", index=False
+                )
+                self.log(f"已输出特征相关性/因果线索: {out_base / f'feature_relation_{now}.csv'}")
             else:
                 imputed = pd.DataFrame(pred_values, columns=feature_train_df.columns)
                 base = feature_test_df.reset_index(drop=True).copy()
                 for col in base.columns:
-                    if base[col].isna().any():
+                    if base[col].isna().any() and col in imputed.columns:
                         base[col] = base[col].fillna(imputed[col])
+
+                # 若模型插补后仍存在空值，则使用经典线性回归兜底插补，保证输出完整。
+                if base.isna().any().any():
+                    from sklearn.linear_model import LinearRegression
+
+                    complete_rows = source_df[~source_df.isna().any(axis=1)].copy()
+                    for col in base.columns:
+                        missing_mask = base[col].isna()
+                        if not missing_mask.any():
+                            continue
+                        feature_cols_for_col = [c for c in base.columns if c != col]
+                        train_part = complete_rows[feature_cols_for_col + [col]].dropna()
+                        if train_part.empty:
+                            continue
+                        x_fit = train_part[feature_cols_for_col]
+                        y_fit = train_part[col]
+                        x_pred = base.loc[missing_mask, feature_cols_for_col]
+                        if x_pred.isna().any().any():
+                            x_pred = x_pred.fillna(x_fit.mean(numeric_only=True))
+                        model = LinearRegression()
+                        model.fit(x_fit, y_fit)
+                        base.loc[missing_mask, col] = model.predict(x_pred)
                 pred_df = base
 
             pred_df.to_csv(pred_path, index=False)
