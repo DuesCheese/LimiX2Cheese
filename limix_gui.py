@@ -490,6 +490,10 @@ class LimiXGuiApp:
                     y_train = np.asarray(y_train, dtype=np.int64)
                 else:
                     y_train = np.asarray(y_raw, dtype=np.float32)
+                    y_mean = float(np.nanmean(y_train)) if len(y_train) else 0.0
+                    y_std = float(np.nanstd(y_train)) if len(y_train) else 1.0
+                    y_std = y_std if np.isfinite(y_std) and y_std > 1e-8 else 1.0
+                    y_train = (y_train - y_mean) / y_std
 
             x_train, encoder_info, encoded_cols = _encode_features(feature_train_df)
             x_test, _, _ = _encode_features(feature_test_df, encoder_info)
@@ -565,7 +569,9 @@ class LimiXGuiApp:
             elif run_cfg.task == "Regression":
                 pred_df = feature_test_df.reset_index(drop=True).copy()
                 pred_col_name = f"pred_{run_cfg.target_columns[0]}"
-                pred_df[pred_col_name] = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+                pred_reg = pred_values if pred_values.ndim == 1 else pred_values[:, 0]
+                pred_reg = pred_reg * y_std + y_mean
+                pred_df[pred_col_name] = pred_reg
 
                 # 小样本、单特征的数值回归场景，优先给出线性回归兜底结果，避免基础模型在外推时出现量纲偏移。
                 if feature_train_df.shape[1] >= 1 and len(feature_train_df) >= 5:
@@ -639,6 +645,46 @@ class LimiXGuiApp:
                             inverse_mapping = {v: k for k, v in encoder_info["category"][col].items()}
                             fill_values = pd.Series(fill_values).round().astype("Int64").map(inverse_mapping)
                         base[col] = base[col].fillna(fill_values)
+
+                # 若模型插补结果接近常数（常见表现为值集中在 19~20），则对该列启用监督回归兜底。
+                complete_rows = source_df[~source_df.isna().any(axis=1)].copy()
+                missing_rows = source_df[source_df.isna().any(axis=1)].copy()
+                if not complete_rows.empty and not missing_rows.empty:
+                    from sklearn.linear_model import LinearRegression
+
+                    for col in base.columns:
+                        missing_mask = source_df[source_df.isna().any(axis=1)][col].isna().to_numpy()
+                        if not missing_mask.any():
+                            continue
+                        limix_fill = base.loc[missing_mask, col]
+                        train_std = float(complete_rows[col].std()) if pd.api.types.is_numeric_dtype(complete_rows[col]) else np.nan
+                        fill_std = float(pd.to_numeric(limix_fill, errors="coerce").std()) if len(limix_fill) > 1 else 0.0
+                        near_constant = (
+                            pd.api.types.is_numeric_dtype(complete_rows[col])
+                            and np.isfinite(train_std)
+                            and train_std > 1e-8
+                            and np.isfinite(fill_std)
+                            and fill_std < 0.05 * train_std
+                        )
+                        if not near_constant:
+                            continue
+
+                        feature_cols_for_col = [c for c in base.columns if c != col]
+                        train_part = complete_rows[feature_cols_for_col + [col]].dropna()
+                        if len(train_part) < 10:
+                            continue
+                        x_fit = train_part[feature_cols_for_col].apply(pd.to_numeric, errors="coerce")
+                        y_fit = pd.to_numeric(train_part[col], errors="coerce")
+                        valid_fit = (~x_fit.isna().any(axis=1)) & y_fit.notna()
+                        if valid_fit.sum() < 10:
+                            continue
+                        x_pred = base.loc[missing_mask, feature_cols_for_col].apply(pd.to_numeric, errors="coerce")
+                        if x_pred.isna().any().any():
+                            x_pred = x_pred.fillna(x_fit.loc[valid_fit].mean())
+                        lr_model = LinearRegression()
+                        lr_model.fit(x_fit.loc[valid_fit], y_fit.loc[valid_fit])
+                        base.loc[missing_mask, col] = lr_model.predict(x_pred)
+                        self.log(f"列 {col} 检测到插补结果近似常数，已切换线性回归兜底插补。")
 
                 # 若模型插补后仍存在空值，则使用经典线性回归兜底插补，保证输出完整。
                 if base.isna().any().any():
