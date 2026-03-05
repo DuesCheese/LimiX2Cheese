@@ -65,6 +65,7 @@ class LimiXGuiApp:
         self.log_file_path = None
         self.worker_thread = None
         self.stop_requested = False
+        self.project_root = Path(__file__).resolve().parent
 
         self.dataframe = None
         self.current_columns: List[str] = []
@@ -225,7 +226,7 @@ class LimiXGuiApp:
         elif task == "Classification":
             self.target_hint.configure(text="分类任务建议只选择 1 个目标列。")
         else:
-            self.target_hint.configure(text="回归任务可多选目标列，多列时会逐列输出预测。")
+            self.target_hint.configure(text="当前版本回归任务仅支持 1 个目标列。")
 
     def _missing_packages(self) -> Tuple[List[str], List[str]]:
         missing_required, missing_optional = [], []
@@ -298,6 +299,9 @@ class LimiXGuiApp:
         if task == "Classification" and len(targets) > 1:
             self.log("提示: 分类任务选了多列，将使用第一个目标列。")
             targets = [targets[0]]
+        if task == "Regression" and len(targets) > 1:
+            self.log("提示: 当前回归任务仅支持单目标，将使用第一个目标列。")
+            targets = [targets[0]]
 
         test_size = float(self.test_size_var.get().strip())
         if not 0.05 <= test_size <= 0.8:
@@ -353,6 +357,14 @@ class LimiXGuiApp:
             from huggingface_hub import hf_hub_download
             from sklearn.model_selection import train_test_split
             from sklearn.preprocessing import LabelEncoder
+
+            if str(self.project_root) not in sys.path:
+                sys.path.insert(0, str(self.project_root))
+
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
 
             from inference.predictor import LimiXPredictor
 
@@ -493,7 +505,7 @@ class LimiXGuiApp:
                 repo_id = "stableai-org/LimiX-16M" if run_cfg.model_size == "16M" else "stableai-org/LimiX-2M"
                 filename = "LimiX-16M.ckpt" if run_cfg.model_size == "16M" else "LimiX-2M.ckpt"
                 self.log(f"未指定本地模型，开始下载: {repo_id}/{filename}")
-                model_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir="./cache")
+                model_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(self.project_root / "cache"))
 
             if run_cfg.task == "Classification":
                 config_name = "config/cls_default_16M_retrieval.json" if run_cfg.use_retrieval else "config/cls_default_noretrieval.json"
@@ -513,6 +525,8 @@ class LimiXGuiApp:
             if device.type == "cpu" and "retrieval" in config_name and "noretrieval" not in config_name:
                 self.log("CPU 不支持 retrieval，自动切换 noretrieval 配置")
                 config_name = "config/cls_default_noretrieval.json" if run_cfg.task == "Classification" else "config/reg_default_noretrieval.json"
+
+            config_name = str(self.project_root / config_name)
 
             self.log(f"使用设备={device}, config={config_name}, model={model_path}")
 
