@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import logging
 import os
 import queue
@@ -25,6 +26,7 @@ REQUIRED_PACKAGES = {
 
 OPTIONAL_PACKAGES = {
     "openpyxl": "openpyxl",
+    "xlrd": "xlrd",
 }
 
 
@@ -203,12 +205,7 @@ class LimiXGuiApp:
 
     def load_columns(self, file_path: str):
         try:
-            import pandas as pd
-
-            if file_path.lower().endswith(".csv"):
-                df = pd.read_csv(file_path)
-            else:
-                df = pd.read_excel(file_path)
+            df = self._read_table_file(file_path)
             self.dataframe = df
             self.current_columns = list(df.columns)
             self.target_listbox.delete(0, tk.END)
@@ -240,7 +237,26 @@ class LimiXGuiApp:
                 __import__(mod)
             except Exception:
                 missing_optional.append(pip_name)
+
+        if importlib.util.find_spec("openpyxl") is None and importlib.util.find_spec("xlrd") is None:
+            if "openpyxl" not in missing_optional:
+                missing_optional.append("openpyxl")
         return missing_required, missing_optional
+
+    def _read_table_file(self, file_path: str):
+        import pandas as pd
+
+        if file_path.lower().endswith(".csv"):
+            return pd.read_csv(file_path)
+        try:
+            return pd.read_excel(file_path)
+        except ImportError as exc:
+            raise ImportError(
+                "读取 Excel 失败：当前 Python 解释器缺少 Excel 引擎依赖。"
+                f"\n当前解释器: {sys.executable}"
+                "\n请在同一个解释器环境安装 openpyxl（.xlsx）或 xlrd（.xls），例如："
+                "python -m pip install openpyxl"
+            ) from exc
 
     def check_dependencies(self):
         missing_required, missing_optional = self._missing_packages()
@@ -369,10 +385,7 @@ class LimiXGuiApp:
             from inference.predictor import LimiXPredictor
 
             self.root.after(0, lambda: self._set_progress(15, "加载数据"))
-            if run_cfg.data_path.lower().endswith(".csv"):
-                df = pd.read_csv(run_cfg.data_path)
-            else:
-                df = pd.read_excel(run_cfg.data_path)
+            df = self._read_table_file(run_cfg.data_path)
 
             predict_df = None
             if run_cfg.predict_data_path:
@@ -733,6 +746,7 @@ class LimiXGuiApp:
 def main():
     root = tk.Tk()
     app = LimiXGuiApp(root)
+    app.log(f"Python 解释器: {sys.executable}")
     app.log("欢迎使用 LimiX2Cheese GUI。建议顺序：检测依赖 -> 选择文件与任务 -> 开始推理")
     root.mainloop()
 
