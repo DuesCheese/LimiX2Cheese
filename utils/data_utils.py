@@ -1,4 +1,5 @@
 import os
+import logging
 
 import numpy as np
 import pandas as pd
@@ -8,6 +9,9 @@ from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from typing import List, Literal
+
+
+logger = logging.getLogger(__name__)
 
 
 class TabularInferenceDataset(Dataset):
@@ -152,7 +156,12 @@ class TabularInferenceDataset(Dataset):
 
 
 
-def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups, cluster_method="overlap"):
+def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor],
+                      k_groups,
+                      cluster_method="overlap",
+                      low_mem_n_test_threshold: int = 4096,
+                      low_mem_unique_threshold: int = 100_000,
+                      minhash_num_perm: int = 64):
     """
         Clusters test samples based on their top-k training data indices.
         Handles variable-length 1D tensors in a list.
@@ -172,6 +181,7 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
                                               refer to the position in the original
                                               list/tensor of test samples.
         """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     is_list_input = False
 
     if isinstance(top_k_indices, list):
@@ -189,7 +199,7 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
     else:  # It's a single 2D tensor
         if not isinstance(top_k_indices, torch.Tensor) or top_k_indices.dim() != 2:
             raise TypeError("Input 'top_k_indices' must be a 2D torch.Tensor or a List of 1D torch.Tensors.")
-        top_k_indices = top_k_indices.to("cuda")
+        top_k_indices = top_k_indices.to(device)
         n_test_samples = top_k_indices.shape[0]
         max_train_len = top_k_indices.shape[1]
 
@@ -228,9 +238,9 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
         if all_rows_list:
             all_rows = torch.cat(all_rows_list)
             all_cols = torch.cat(all_cols_list)
-            data = torch.ones(len(all_rows), dtype=torch.float,device="cuda")
+            data = torch.ones(len(all_rows), dtype=torch.float, device=device)
 
-            indices = torch.stack([all_rows, all_cols]).to("cuda")
+            indices = torch.stack([all_rows.long(), all_cols.long()]).to(device)
             binary_matrix_sparse = torch.sparse_coo_tensor(
                 indices, data,
                 size=(n_test_samples, len(index_to_col))
@@ -238,7 +248,7 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
 
 
         else:
-            indices = torch.empty((2, 0), dtype=torch.float)
+            indices = torch.empty((2, 0), dtype=torch.long)
             data = torch.empty(0, dtype=torch.float)
             binary_matrix_sparse= torch.sparse_coo_tensor(
                 indices, data,
@@ -260,39 +270,50 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
             k_fixed
         )
 
-        data = torch.ones(n_test_samples * k_fixed, dtype=torch.float,device="cuda")
+        data = torch.ones(n_test_samples * k_fixed, dtype=torch.float, device=device)
 
-        indices = torch.stack([rows, cols]).to("cuda")
+        indices = torch.stack([rows.long(), cols.long()]).to(device)
         binary_matrix_sparse = torch.sparse_coo_tensor(
             indices, data,
             size=(n_test_samples, len(index_to_col))
         ).coalesce()
 
-    # Create sparse tensor (assuming GPU usage as per original code)
-    # Check if we have any data to create the tensor
+    use_low_mem_strategy = (n_test_samples > low_mem_n_test_threshold) or (num_unique > low_mem_unique_threshold)
 
+    if use_low_mem_strategy:
+        logger.warning(
+            "cluster_test_data switches to low-memory MinHash strategy (n_test_samples=%d, num_unique=%d, "
+            "thresholds=(%d, %d)).",
+            n_test_samples,
+            num_unique,
+            low_mem_n_test_threshold,
+            low_mem_unique_threshold,
+        )
 
-    # --- Compute overlap matrix ---
-    binary_dense = binary_matrix_sparse.to_dense()
-    # Matrix multiplication to get pairwise overlaps (n_test_samples x n_test_samples)
-    # This works even if the original "k" was variable, as the dense matrix captures the relationship.
-    overlap_matrix = torch.mm(binary_dense, binary_dense.t()).to("cuda")
+        seed = 42
+        rng = np.random.default_rng(seed)
+        primes = np.uint64(4294967311)
+        a = torch.from_numpy(rng.integers(1, int(primes - 1), size=minhash_num_perm, dtype=np.uint64)).to(device)
+        b = torch.from_numpy(rng.integers(0, int(primes - 1), size=minhash_num_perm, dtype=np.uint64)).to(device)
 
-    # Adjust diagonal: overlap of a sample with itself
-    # For variable k, the self-overlap is the number of indices for that specific sample.
-    diag_indices = torch.arange(n_test_samples, device="cuda")
-    if is_list_input:
-        # Diagonal entry (i,i) should be the count of indices for sample i
-        diag_values = torch.tensor([len(t) for t in top_k_indices], dtype=torch.float, device="cuda")
+        minhash_signatures = torch.full((n_test_samples, minhash_num_perm), int(primes - 1), dtype=torch.int64,
+                                        device=device)
+
+        source_sets = top_k_indices if is_list_input else [row for row in top_k_indices]
+        for row_i, sample_indices_tensor in enumerate(source_sets):
+            if sample_indices_tensor.numel() == 0:
+                continue
+            vals = sample_indices_tensor.to(device=device, dtype=torch.int64)
+            hashed = (vals.unsqueeze(1) * a.unsqueeze(0) + b.unsqueeze(0)) % primes
+            minhash_signatures[row_i] = hashed.min(dim=0).values.to(torch.int64)
+
+        cluster_input = minhash_signatures.float()
     else:
-        # For fixed k tensor, diagonal is simply k
-        diag_values = torch.full((n_test_samples,), max_train_len, dtype=torch.float, device="cuda")
-
-    overlap_matrix[diag_indices, diag_indices] = diag_values
+        cluster_input = binary_matrix_sparse.to_dense()
 
     # --- Perform clustering ---
     # Assuming gpu_kmeans takes (data_points, k) and returns labels
-    cluster_labels = gpu_kmeans(binary_dense, k_groups)
+    cluster_labels = gpu_kmeans(cluster_input, k_groups)
 
     # --- Prepare results ---
     clusters_sample_indices = {}
@@ -311,7 +332,7 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
                     if indices_to_concat:  # Check if list is not empty
                         union_indices = torch.unique(torch.cat(indices_to_concat, dim=0))
                     else:
-                        union_indices = torch.empty(0, dtype=torch.long, device="cuda")  # Or appropriate device
+                        union_indices = torch.empty(0, dtype=torch.long, device=device)  # Or appropriate device
                 else:
                     union_indices = torch.unique(top_k_indices[indices_in_cluster, :])
 
@@ -323,7 +344,7 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor], k_groups
                     if indices_to_concat:
                         union_indices = torch.cat(indices_to_concat, dim=0)
                     else:
-                        union_indices = torch.empty(0, dtype=torch.long, device="cuda")
+                        union_indices = torch.empty(0, dtype=torch.long, device=device)
                 else:
                     union_indices = top_k_indices[indices_in_cluster, :].flatten()
 
@@ -426,4 +447,3 @@ def load_data(data_root,folder):
     return trainX, trainy, testX, testy
 if __name__ == '__main__':
     pass
-
