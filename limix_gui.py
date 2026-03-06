@@ -41,6 +41,7 @@ class RunConfig:
     use_cpu: bool
     use_retrieval: bool
     local_output_dir: str
+    max_infer_batch_rows: int
 
 
 class TkQueueHandler(logging.Handler):
@@ -119,10 +120,14 @@ class LimiXGuiApp:
         self.seed_var = tk.StringVar(value="42")
         ttk.Entry(model_frame, textvariable=self.seed_var, width=10).grid(row=2, column=2, sticky=tk.W)
 
-        ttk.Label(model_frame, text="输出目录:").grid(row=3, column=0, sticky=tk.W)
+        ttk.Label(model_frame, text="最大推理批大小(行):").grid(row=3, column=0, sticky=tk.W)
+        self.max_infer_batch_rows_var = tk.StringVar(value="2048")
+        ttk.Entry(model_frame, textvariable=self.max_infer_batch_rows_var, width=10).grid(row=3, column=1, sticky=tk.W)
+
+        ttk.Label(model_frame, text="输出目录:").grid(row=4, column=0, sticky=tk.W)
         self.output_dir_var = tk.StringVar(value="./outputs")
-        ttk.Entry(model_frame, textvariable=self.output_dir_var, width=78).grid(row=3, column=1, padx=5)
-        ttk.Button(model_frame, text="选择目录", command=self.select_output_dir).grid(row=3, column=2)
+        ttk.Entry(model_frame, textvariable=self.output_dir_var, width=78).grid(row=4, column=1, padx=5)
+        ttk.Button(model_frame, text="选择目录", command=self.select_output_dir).grid(row=4, column=2)
 
         target_frame = ttk.LabelFrame(self.root, text="目标列选择（分类/回归）", padding=10)
         target_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=5)
@@ -308,6 +313,10 @@ class LimiXGuiApp:
             raise ValueError("测试集比例建议在 0.05 ~ 0.8")
         random_state = int(self.seed_var.get().strip())
 
+        max_infer_batch_rows = int(self.max_infer_batch_rows_var.get().strip())
+        if max_infer_batch_rows <= 0:
+            raise ValueError("最大推理批大小必须为正整数")
+
         out_dir = self.output_dir_var.get().strip() or "./outputs"
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -323,6 +332,7 @@ class LimiXGuiApp:
             use_cpu=bool(self.use_cpu_var.get()),
             use_retrieval=bool(self.use_retrieval_var.get()),
             local_output_dir=out_dir,
+            max_infer_batch_rows=max_infer_batch_rows,
         )
 
     def start_run(self):
@@ -560,6 +570,7 @@ class LimiXGuiApp:
                 model_path=model_path,
                 inference_config=config_name,
                 mask_prediction=(run_cfg.task == "Missing Value Imputation"),
+                max_infer_batch_rows=run_cfg.max_infer_batch_rows,
             )
 
             if run_cfg.task == "Missing Value Imputation":

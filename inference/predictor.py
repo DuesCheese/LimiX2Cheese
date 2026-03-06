@@ -34,6 +34,7 @@ class LimiXPredictor:
                  mix_precision:bool=True,
                  outlier_remove_std: float=12,
                  softmax_temperature:float=0.9,
+                 max_infer_batch_rows:int|None=None,
                 #  task_type: Literal['Classification', 'Regression']='Classification',
                  mask_prediction:bool=False,
                  categorical_features_indices:List[int]|None=None,
@@ -78,6 +79,7 @@ class LimiXPredictor:
         self.min_unique_num_for_numerical_infer = 4
         self.preprocess_num = 10
         self.softmax_temperature = softmax_temperature
+        self.max_infer_batch_rows = max_infer_batch_rows
         # self.task_type = task_type
         self.mask_prediction = mask_prediction        
         self.inference_with_DDP=inference_with_DDP
@@ -94,6 +96,54 @@ class LimiXPredictor:
         self.preprocess_configs = []
 
         self.build_preprocess_pipeline()
+
+    def _resolve_max_infer_batch_rows(self, id_pipe:int) -> int|None:
+        config_limit = self.inference_config[id_pipe].get("max_infer_batch_rows", None)
+        if config_limit is None:
+            config_limit = self.max_infer_batch_rows
+        if config_limit is None:
+            return None
+        config_limit = int(config_limit)
+        return config_limit if config_limit > 0 else None
+
+    def _batched_forward(self, x_:np.ndarray, y_:np.ndarray, n_train:int, task_type:Literal['cls', 'reg'], pipe:List, id_pipe:int):
+        self.model.to(self.device)
+        y_tensor = torch.from_numpy(y_).to(device=self.device, dtype=torch.float32)
+        x_train_tensor = torch.from_numpy(x_[:n_train]).to(device=self.device, dtype=torch.float32)
+        x_test_np = x_[n_train:]
+        max_batch_rows = self._resolve_max_infer_batch_rows(id_pipe)
+        if max_batch_rows is None:
+            max_batch_rows = max(len(x_test_np), 1)
+
+        output_chunks = []
+        mask_prediction_chunks = []
+        with (torch.autocast(device_type=self.device.type if isinstance(self.device, torch.device) else self.device,
+                             enabled=self.mix_precision), torch.inference_mode()):
+            for start in range(0, len(x_test_np), max_batch_rows):
+                stop = min(start + max_batch_rows, len(x_test_np))
+                x_test_chunk = torch.from_numpy(x_test_np[start:stop]).to(device=self.device, dtype=torch.float32)
+                x_batch = torch.cat((x_train_tensor, x_test_chunk), dim=0).unsqueeze(0)
+                y_batch = y_tensor.unsqueeze(0)
+                model_output = self.model(x=x_batch, y=y_batch, eval_pos=y_batch.shape[1], task_type=task_type)
+
+                if self.mask_prediction:
+                    process_config = model_output['process_config']
+                    output_feature_pred = self.PostProcessInModel(model_output['feature_pred'], process_config)
+                    output_feature_pred = self.PostProcess(output_feature_pred, pipe, process_config)
+                    mask_prediction_chunks.append(output_feature_pred[-(stop-start):])
+                    model_output = model_output[f'{task_type}_output']
+
+                model_output = model_output if isinstance(model_output, dict) else model_output.squeeze(0)
+                output_chunks.append(model_output[-(stop-start):])
+                del x_test_chunk, x_batch, model_output
+
+        if len(output_chunks) == 0:
+            output = torch.empty((0,), device=self.device)
+        else:
+            output = torch.cat(output_chunks, dim=0)
+        mask_prediction = np.concatenate(mask_prediction_chunks, axis=0) if self.mask_prediction and len(mask_prediction_chunks) > 0 else None
+        del y_tensor, x_train_tensor
+        return output, mask_prediction
 
     def set_inference_config(self, inference_config: list|str, softmax_temperature:float|None=None, seed:int|None=None):
         if isinstance(inference_config, str):
@@ -314,16 +364,16 @@ class LimiXPredictor:
             self.class_permutations += [uniqs[i] for i in np_rng.choice(len(uniqs), size=cout)]
         
         # Preprocess x
-        x = self.convert_x_dtypes(x)
+        x = self.convert_x_dtypes(x, dtypes="float32")
         x = self.convert_category2num(x)
-        x = x.astype(np.float32)
+        x = x.astype(np.float32, copy=False)
         categorical_idx = self.get_categorical_features_indices(x)
         outputs = []
         mask_predictions = []
         for id_pipe, pipe in enumerate(self.preprocess_pipelines):
             x_ = x.copy()
-            y_ = self.class_permutations[id_pipe][y.copy()]
-            categorical_idx_ = categorical_idx.copy()
+            y_ = self.class_permutations[id_pipe][y]
+            categorical_idx_ = list(categorical_idx)
             for id_step, step in enumerate(pipe):
                 if isinstance(step, InferenceAttentionMap):
                     feature_attention_score, sample_attention_score = step.inference(X_train=x_[:len(y_train)].astype(np.float32),
@@ -332,29 +382,30 @@ class LimiXPredictor:
                                                                                      task_type="cls",device=self.device)
                    
                 elif isinstance(step, SubSampleData):
-                    step.fit(torch.from_numpy(x_[:len(y_train)]), torch.from_numpy(y_train),
+                    step.fit(torch.from_numpy(x_[:len(y_train)]), torch.from_numpy(y_train.astype(np.float32, copy=False)),
                              feature_attention_score=feature_attention_score,
                              sample_attention_score=sample_attention_score,
                              subsample_ratio=self.inference_config[id_pipe]["retrieval_config"].get("sub_feature_ratio", 0.5))
                     if self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "feature":
-                        x_ = step.transform(torch.from_numpy(x_[len(y_train):]).float())
+                        x_ = step.transform(torch.from_numpy(x_[len(y_train):]).to(dtype=torch.float32))
                         categorical_idx_ = self.get_categorical_features_indices(x_)
                     else:
-                        attention_score = step.transform(torch.from_numpy(x_[len(y_train):]).float())
+                        attention_score = step.transform(torch.from_numpy(x_[len(y_train):]).to(dtype=torch.float32))
                 else:
                     x_, categorical_idx_ = step.fit_transform(x_, categorical_idx_, self.seeds[id_pipe*self.preprocess_num+id_step], y=y_)
                     # print(f"step {id_step} categorical_idx_ {categorical_idx_}")
             
-            x_ = torch.from_numpy(x_[:, :]).float().to(self.device)
-            y_ = torch.from_numpy(y_).float().to(self.device)
+            y_for_infer = y_.astype(np.float32, copy=False)
             torch.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)
             if self.inference_config[id_pipe]["retrieval_config"]["use_retrieval"] and \
                     self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "sample":
+                x_tensor = torch.from_numpy(x_[:, :]).to(device=self.device, dtype=torch.float32)
+                y_tensor = torch.from_numpy(y_for_infer).to(device=self.device, dtype=torch.float32)
                 inference = InferenceResultWithRetrieval(model=self.model,
                                                          sample_selection_type="AM")
-                output = inference.inference(x_[:len(y_train)], y_,
-                                             x_[len(y_train):],
+                output = inference.inference(x_tensor[:len(y_train)], y_tensor,
+                                             x_tensor[len(y_train):],
                                              attention_score=attention_score,
                                              retrieval_len=self.inference_config[id_pipe]["retrieval_config"][
                                                  "retrieval_len"],
@@ -376,36 +427,28 @@ class LimiXPredictor:
 
                 output = output[..., self.class_permutations[id_pipe]]
                 outputs.append(output)
+                del x_tensor, y_tensor
             elif self.inference_with_DDP:
+                x_tensor = torch.from_numpy(x_[:, :]).to(device=self.device, dtype=torch.float32)
+                y_tensor = torch.from_numpy(y_for_infer).to(device=self.device, dtype=torch.float32)
                 inference = InferenceResultWithRetrieval(model=self.model,
                                                          sample_selection_type="DDP")
-                output = inference.inference(x_[:len(y_train)].squeeze(1), y_, x_[len(y_train):].squeeze(1),
+                output = inference.inference(x_tensor[:len(y_train)].squeeze(1), y_tensor, x_tensor[len(y_train):].squeeze(1),
                                              task_type="cls")
                 if self.softmax_temperature != 1:
                     output = (output[:, :self.n_classes].float() / self.softmax_temperature)
 
                 output = output[..., self.class_permutations[id_pipe]]
                 outputs.append(output)
+                del x_tensor, y_tensor
             else:
-                self.model.to(self.device)
-                with(torch.autocast(device_type=self.device.type if isinstance(self.device, torch.device) else self.device, enabled=self.mix_precision), torch.inference_mode()):
-                    x_=x_.unsqueeze(0)
-                    y_ = y_.unsqueeze(0)
-                    output=self.model(x=x_, y=y_, eval_pos=y_.shape[1], task_type='cls')
+                output, mask_prediction_batch = self._batched_forward(x_, y_for_infer, len(y_train), 'cls', pipe, id_pipe)
+                if self.mask_prediction and mask_prediction_batch is not None:
+                    mask_predictions.append(mask_prediction_batch)
+                if self.softmax_temperature != 1:
+                    output = (output[:, :self.n_classes].float() / self.softmax_temperature)
 
-                    if self.mask_prediction:
-                        process_config = output['process_config']
-                        output_feature_pred = self.PostProcessInModel(output['feature_pred'], process_config)
-                        output_feature_pred = self.PostProcess(output_feature_pred, pipe, process_config)
-                        mask_predictions.append(output_feature_pred)
-                        output = output['cls_output']
-
-                    output = output if isinstance(output, dict) else output.squeeze(0)
-
-                    if self.softmax_temperature != 1:
-                        output = (output[:, :self.n_classes].float() / self.softmax_temperature)
-
-                    output = output[..., self.class_permutations[id_pipe]]
+                output = output[..., self.class_permutations[id_pipe]]
                 outputs.append(output)
             
         outputs = [torch.nn.functional.softmax(o, dim=1) for o in outputs]
@@ -515,18 +558,19 @@ class LimiXPredictor:
         x = np.concatenate([x_train, x_test], axis=0)
     
         # preprocess x
-        x = self.convert_x_dtypes(x)
+        x = self.convert_x_dtypes(x, dtypes="float32" if self.device.type == 'cpu' else "float64")
         x = self.convert_category2num(x)
-        # x = x.astype(np.float32)
-        # y_train = y_train.astype(np.float32)
+        if self.device.type == 'cpu':
+            x = x.astype(np.float32, copy=False)
+            y_train = y_train.astype(np.float32, copy=False)
         categorical_idx = self.get_categorical_features_indices(x)
     
         outputs = []
         mask_predictions = []
         for id_pipe, pipe in enumerate(self.preprocess_pipelines):
             x_ = x.copy()
-            y_ = y_train.copy()
-            categorical_idx_ = categorical_idx.copy()
+            y_ = y_train
+            categorical_idx_ = list(categorical_idx)
             for id_step, step in enumerate(pipe):
                 if isinstance(step, InferenceAttentionMap):
 
@@ -536,28 +580,29 @@ class LimiXPredictor:
                                                                                      task_type="reg",device=self.device)
                     
                 elif isinstance(step, SubSampleData):
-                    step.fit(torch.from_numpy(x_[:len(y_train)]), torch.from_numpy(y_train),
+                    step.fit(torch.from_numpy(x_[:len(y_train)]), torch.from_numpy(y_train.astype(np.float32, copy=False)),
                              feature_attention_score=feature_attention_score,
                              sample_attention_score=sample_attention_score,
                              subsample_ratio=self.inference_config[id_pipe]["retrieval_config"].get("sub_feature_ratio", 0.5))
                     if self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "feature":
-                        x_ = step.transform(torch.from_numpy(x_[len(y_train):]).float())
+                        x_ = step.transform(torch.from_numpy(x_[len(y_train):]).to(dtype=torch.float32))
                         categorical_idx_ = self.get_categorical_features_indices(x_)
                     else:
-                        attention_score = step.transform(torch.from_numpy(x_[len(y_train):]).float())
+                        attention_score = step.transform(torch.from_numpy(x_[len(y_train):]).to(dtype=torch.float32))
                 else:
                     x_, categorical_idx_ = step.fit_transform(x_, categorical_idx_, self.seeds[id_pipe*self.preprocess_num+id_step], y=y_)
             
-            x_ = torch.from_numpy(x_[:, :]).float().to(self.device)
-            y_ = torch.from_numpy(y_).float().to(self.device)
+            y_for_infer = y_.astype(np.float32, copy=False)
             torch.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)
             if self.inference_config[id_pipe]["retrieval_config"]["use_retrieval"] and \
                     self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "sample":
+                x_tensor = torch.from_numpy(x_[:, :]).to(device=self.device, dtype=torch.float32)
+                y_tensor = torch.from_numpy(y_for_infer).to(device=self.device, dtype=torch.float32)
                 inference = InferenceResultWithRetrieval(model=self.model,
                                                          sample_selection_type="AM")
-                output = inference.inference(x_[:len(y_train)], y_,
-                                             x_[len(y_train):],
+                output = inference.inference(x_tensor[:len(y_train)], y_tensor,
+                                             x_tensor[len(y_train):],
                                              attention_score=attention_score,
                                              retrieval_len=self.inference_config[id_pipe]["retrieval_config"][
                                                  "retrieval_len"],
@@ -575,28 +620,20 @@ class LimiXPredictor:
                                              mixed_method=self.inference_config[id_pipe]["retrieval_config"].get(
                                                  "mixed_method", "max"),device=self.device)
                 outputs.append(output)
+                del x_tensor, y_tensor
             elif self.inference_with_DDP:
+                x_tensor = torch.from_numpy(x_[:, :]).to(device=self.device, dtype=torch.float32)
+                y_tensor = torch.from_numpy(y_for_infer).to(device=self.device, dtype=torch.float32)
                 inference = InferenceResultWithRetrieval(model=self.model,
                                                          sample_selection_type="DDP")
-                output = inference.inference(x_[:len(y_train)].squeeze(1), y_, x_[len(y_train):].squeeze(1),
+                output = inference.inference(x_tensor[:len(y_train)].squeeze(1), y_tensor, x_tensor[len(y_train):].squeeze(1),
                                              task_type="reg")
                 outputs.append(output)
+                del x_tensor, y_tensor
             else:
-                self.model.to(self.device)
-                with(torch.autocast(device_type=self.device.type if isinstance(self.device, torch.device) else self.device, enabled=self.mix_precision), torch.inference_mode()):
-                    x_=x_.unsqueeze(0)
-                    y_ = y_.unsqueeze(0)
-
-                    output=self.model(x=x_, y=y_, eval_pos=y_.shape[1], task_type='reg')
-
-                if self.mask_prediction:
-                    process_config = output['process_config']
-                    output_feature_pred = self.PostProcessInModel(output['feature_pred'], process_config)
-                    output_feature_pred = self.PostProcess(output_feature_pred, pipe, process_config)
-                    mask_predictions.append(output_feature_pred)
-                    output = output['reg_output']
-
-                output = output if isinstance(output, dict) else output.squeeze(0)
+                output, mask_prediction_batch = self._batched_forward(x_, y_for_infer, len(y_train), 'reg', pipe, id_pipe)
+                if self.mask_prediction and mask_prediction_batch is not None:
+                    mask_predictions.append(mask_prediction_batch)
             outputs.append(output)
             
         output = torch.stack(outputs).squeeze(2).mean(dim=0)
