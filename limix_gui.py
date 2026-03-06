@@ -500,7 +500,27 @@ class LimiXGuiApp:
 
             self.root.after(0, lambda: self._set_progress(45, "准备模型"))
 
-            use_cuda = torch.cuda.is_available() and not run_cfg.use_cpu
+            cuda_available = torch.cuda.is_available()
+            cuda_device_count = torch.cuda.device_count()
+            self.log(f"Python 可执行文件: {sys.executable}")
+            self.log(f"torch.__version__={torch.__version__}")
+            self.log(f"torch.version.cuda={torch.version.cuda}")
+            self.log(f"torch.cuda.is_available()={cuda_available}")
+            self.log(f"torch.cuda.device_count()={cuda_device_count}")
+            self.log(f"run_cfg.use_cpu={run_cfg.use_cpu}")
+
+            if run_cfg.use_cpu:
+                self.log("用户选择强制 CPU")
+
+            if not cuda_available:
+                no_cuda_msg = (
+                    "当前 Python 环境未检测到 CUDA。"
+                    "请检查 GUI 使用的解释器/虚拟环境是否与命令行一致。"
+                )
+                self.log(no_cuda_msg)
+                self.root.after(0, lambda: messagebox.showwarning("CUDA 未检测到", no_cuda_msg))
+
+            use_cuda = cuda_available and not run_cfg.use_cpu
             device = torch.device("cuda" if use_cuda else "cpu")
 
             if run_cfg.model_path:
