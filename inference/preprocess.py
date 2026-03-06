@@ -1,4 +1,5 @@
 import numpy as np
+import logging
 from torch.utils.data import DataLoader, Dataset
 import torch
 import warnings
@@ -244,13 +245,26 @@ class CategoricalFeatureEncoder(BasePreprocess):
     def __init__(
         self,
         encoding_strategy: Literal['ordinal', 'ordinal_strict_feature_shuffled', 'ordinal_shuffled', 'onehot', 'numeric', 'none']|None = "ordinal",
+        onehot_cardinality_threshold: int = 128,
+        onehot_fallback_strategy: Literal['ordinal'] = "ordinal",
+        onehot_max_dimensions: int | None = None,
+        onehot_force_dense: bool = False,
+        onehot_dense_chunk_size: int = 2048,
     ):
         super().__init__()
         self.encoding_strategy = encoding_strategy
+        self.onehot_cardinality_threshold = onehot_cardinality_threshold
+        self.onehot_fallback_strategy = onehot_fallback_strategy
+        self.onehot_max_dimensions = onehot_max_dimensions
+        self.onehot_force_dense = onehot_force_dense
+        self.onehot_dense_chunk_size = onehot_dense_chunk_size
         self.random_seed = None
         self.transformer = None
         self.category_mappings = None
         self.categorical_features = None
+        self.high_cardinality_fallback_columns: list[tuple[int, int]] = []
+
+        self._logger = logging.getLogger(__name__)
 
     @override
     def fit_transform(self, x:np.ndarray, categorical_features:list[int], seed:int, **kwargs) -> tuple[np.ndarray, list[int]]:
@@ -289,13 +303,36 @@ class CategoricalFeatureEncoder(BasePreprocess):
 
         elif self.encoding_strategy == "onehot":
             Xt = ct.fit_transform(X)
-            if Xt.size >= 1_000_000:
+
+            onehot_slice = ct.output_indices_.get("one_hot_encoder", slice(0, 0))
+            onehot_dim = onehot_slice.stop - onehot_slice.start
+            fallback_slice = ct.output_indices_.get("fallback_ordinal_encoder")
+            fallback_dim = 0 if fallback_slice is None else (fallback_slice.stop - fallback_slice.start)
+            onehot_reduced = False
+
+            if self.onehot_max_dimensions is not None and onehot_dim > self.onehot_max_dimensions:
+                Xt = self._reduce_onehot_dimensions(
+                    Xt,
+                    onehot_slice,
+                    target_dims=self.onehot_max_dimensions,
+                    random_state=int(self.random_seed) if self.random_seed is not None else None,
+                )
+                onehot_slice = slice(0, self.onehot_max_dimensions)
+                onehot_reduced = True
+
+            if self.onehot_force_dense and scipy.sparse.issparse(Xt):
+                Xt = self._sparse_to_dense_in_chunks(Xt)
+
+            if Xt.shape[0] * Xt.shape[1] >= 1_000_000:
                 ct = None
                 Xt = X
             else:
-                categorical_features = list(range(Xt.shape[1]))[
-                    ct.output_indices_["one_hot_encoder"]
-                ]
+                onehot_features = list(range(onehot_slice.start, onehot_slice.stop))
+                fallback_features = []
+                if fallback_dim > 0:
+                    fallback_start = onehot_slice.stop if onehot_reduced else fallback_slice.start
+                    fallback_features = list(range(fallback_start, fallback_start + fallback_dim))
+                categorical_features = onehot_features + fallback_features
         else:
             raise ValueError(
                 f"Unknown categorical transform {self.encoding_strategy}",
@@ -331,8 +368,43 @@ class CategoricalFeatureEncoder(BasePreprocess):
             ), categorical_columns
             
         elif self.encoding_strategy == "onehot":
+            high_cardinality_columns = [
+                idx for idx in categorical_columns
+                if len(np.unique(data[:, idx])) > self.onehot_cardinality_threshold
+            ]
+            onehot_columns = [idx for idx in categorical_columns if idx not in high_cardinality_columns]
+
+            if high_cardinality_columns:
+                self.high_cardinality_fallback_columns = [
+                    (idx, len(np.unique(data[:, idx]))) for idx in high_cardinality_columns
+                ]
+                fallback_desc = ", ".join(
+                    f"col_{idx}({count})" for idx, count in self.high_cardinality_fallback_columns
+                )
+                self._logger.warning(
+                    "High-cardinality categorical columns exceed threshold=%d, fallback=%s: %s",
+                    self.onehot_cardinality_threshold,
+                    self.onehot_fallback_strategy,
+                    fallback_desc,
+                )
+
+            transformers = []
+            if onehot_columns:
+                transformers.append(
+                    ("one_hot_encoder", OneHotEncoder(drop="if_binary", sparse_output=True, handle_unknown="ignore"), onehot_columns)
+                )
+
+            if high_cardinality_columns and self.onehot_fallback_strategy == "ordinal":
+                transformers.append(
+                    (
+                        "fallback_ordinal_encoder",
+                        OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan),
+                        high_cardinality_columns,
+                    )
+                )
+
             return ColumnTransformer(
-                [("one_hot_encoder", OneHotEncoder(drop="if_binary", sparse_output=False, handle_unknown="ignore"), categorical_columns)],
+                transformers,
                 remainder="passthrough"
             ), categorical_columns
             
@@ -340,6 +412,38 @@ class CategoricalFeatureEncoder(BasePreprocess):
             return None, categorical_columns
             
         raise ValueError(f"Unsupported encoding strategy: {self.encoding_strategy}")
+
+    def _sparse_to_dense_in_chunks(self, Xt: scipy.sparse.spmatrix) -> np.ndarray:
+        chunks = []
+        for start in range(0, Xt.shape[0], self.onehot_dense_chunk_size):
+            stop = min(start + self.onehot_dense_chunk_size, Xt.shape[0])
+            chunks.append(Xt[start:stop].toarray())
+        return np.vstack(chunks) if chunks else np.empty((0, Xt.shape[1]))
+
+    def _reduce_onehot_dimensions(
+        self,
+        Xt: np.ndarray | scipy.sparse.spmatrix,
+        onehot_slice: slice,
+        target_dims: int,
+        random_state: int | None,
+    ) -> np.ndarray | scipy.sparse.spmatrix:
+        if onehot_slice.stop <= onehot_slice.start:
+            return Xt
+
+        onehot_part = Xt[:, onehot_slice]
+        if target_dims >= onehot_part.shape[1]:
+            return Xt
+
+        svd = TruncatedSVD(n_components=target_dims, random_state=random_state)
+        onehot_reduced = svd.fit_transform(onehot_part)
+
+        if scipy.sparse.issparse(Xt):
+            other_part = scipy.sparse.hstack([Xt[:, :onehot_slice.start], Xt[:, onehot_slice.stop:]], format="csr")
+            other_part = other_part.toarray()
+        else:
+            other_part = np.hstack([Xt[:, :onehot_slice.start], Xt[:, onehot_slice.stop:]])
+
+        return np.hstack([onehot_reduced, other_part])
 
     def _is_valid_common_category(self, column: np.ndarray, suffix: str) -> bool:
         """Check whether the input data meets the common category conditions"""
