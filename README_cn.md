@@ -133,32 +133,7 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 
 
 ## ➩ GUI 前端（LimiX2Cheese）
-项目新增了一个简易桌面前端 `limix_gui.py`，可用于“一键式”执行分类、回归和缺失值插补推理。
-
-### 功能
-- 自动检测缺失依赖（可一键安装）
-- 选择输入文件（`csv/xlsx/xls`）
-- 选择任务（分类 / 回归 / 缺失值插补）
-- 选择模型（本地 `.ckpt` 或自动从 HuggingFace 下载）
-- 回归任务支持目标列选择（多选）
-- 进度条与实时日志
-- 运行结束后自动导出预测结果 `csv`、运行元数据 `json`、日志 `log`
-
-### 启动方式
-```bash
-python limix_gui.py
-# 或 Linux/macOS
-./run_gui.sh
-# 或 Windows 双击
-run_gui.bat
-```
-
-### 打包 exe（可选）
-```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name LimiX2Cheese-GUI limix_gui.py
-```
-打包后的可执行文件位于 `dist/LimiX2Cheese-GUI(.exe)`。
+GUI 使用说明见 [`doc/gui_usage_cn.md`](doc/gui_usage_cn.md)。
 
 ## ➩ 基于样本检索的ensemble推理
 基于样本检索的ensemble推理的详细技术描述详见[LimiX技术报告](https://github.com/limix-ldm/LimiX/blob/main/LimiX_Technical_Report.pdf)

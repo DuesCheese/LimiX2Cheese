@@ -142,32 +142,7 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 
 
 ## ➩ GUI Front-End (LimiX2Cheese)
-A lightweight desktop GUI has been added as `limix_gui.py` for one-click inference workflows.
-
-### Features
-- Auto-check missing dependencies (with one-click install)
-- Select input file (`csv/xlsx/xls`)
-- Select task (classification / regression / missing-value imputation)
-- Select local `.ckpt` model or auto-download from Hugging Face
-- Multi-select regression target columns
-- Progress bar + real-time logs
-- Export prediction `csv`, run metadata `json`, and `log` file
-
-### Launch
-```bash
-python limix_gui.py
-# or Linux/macOS
-./run_gui.sh
-# or Windows double-click
-run_gui.bat
-```
-
-### Package as EXE (optional)
-```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name LimiX2Cheese-GUI limix_gui.py
-```
-The generated executable will be in `dist/LimiX2Cheese-GUI(.exe)`.
+For GUI usage details, please see [`doc/gui_usage.md`](doc/gui_usage.md).
 
 ## ➩ Ensemble Inference Based on Sample Retrieval
 
