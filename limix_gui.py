@@ -685,7 +685,16 @@ class LimiXGuiApp:
                 pred_label = pred_values.argmax(axis=1)
                 pred_label_raw = label_encoder.inverse_transform(pred_label)
                 prob_cols = [f"prob_{str(class_name)}" for class_name in label_encoder.classes_]
-                pred_df = pd.DataFrame(pred_values, columns=prob_cols)
+                pred_df = feature_test_df.reset_index(drop=True).copy()
+                prob_df = pd.DataFrame(pred_values, columns=prob_cols).reset_index(drop=True)
+                if len(prob_df) != len(pred_df):
+                    keep_rows = min(len(prob_df), len(pred_df))
+                    self.log(f"分类结果行数({len(prob_df)})与测试特征行数({len(pred_df)})不一致，截断到{keep_rows}行。")
+                    pred_df = pred_df.iloc[:keep_rows].copy()
+                    prob_df = prob_df.iloc[:keep_rows].copy()
+                    pred_label = pred_label[:keep_rows]
+                    pred_label_raw = pred_label_raw[:keep_rows]
+                pred_df = pd.concat([pred_df, prob_df], axis=1)
                 pred_df.insert(0, "pred_label_raw", pred_label_raw)
                 pred_df.insert(0, "pred_label", pred_label)
             elif run_cfg.task == "Regression":
