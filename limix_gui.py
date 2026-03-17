@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import logging
 import os
@@ -73,6 +74,7 @@ class LimiXGuiApp:
 
         self._build_ui()
         self._setup_logger()
+        self._refresh_runtime_info()
         self._poll_log_queue()
 
     def _build_ui(self):
@@ -148,6 +150,11 @@ class LimiXGuiApp:
         ttk.Button(actions, text="1) 检测依赖", command=self.check_dependencies).pack(side=tk.LEFT)
         ttk.Button(actions, text="2) 自动安装缺失依赖", command=self.install_missing_dependencies).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="3) 开始推理", command=self.start_run).pack(side=tk.LEFT)
+
+        runtime_frame = ttk.LabelFrame(self.root, text="当前运行环境", padding=10)
+        runtime_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.runtime_info_var = tk.StringVar(value="解释器路径: 检测中...")
+        ttk.Label(runtime_frame, textvariable=self.runtime_info_var, justify=tk.LEFT, anchor=tk.W).pack(fill=tk.X)
 
         self.progress = ttk.Progressbar(actions, mode="determinate", length=260)
         self.progress.pack(side=tk.LEFT, padx=10)
@@ -233,6 +240,51 @@ class LimiXGuiApp:
         else:
             self.target_hint.configure(text="当前版本回归任务仅支持 1 个目标列。")
 
+    def _get_runtime_env_info(self) -> dict:
+        info = {
+            "python_executable": sys.executable,
+            "torch_version": "未安装",
+            "torch_cuda_version": "-",
+            "cuda_available": "-",
+            "cuda_status": "torch 未安装，无法检测 CUDA",
+        }
+
+        if importlib.util.find_spec("torch") is None:
+            return info
+
+        try:
+            import torch
+
+            info["torch_version"] = getattr(torch, "__version__", "unknown")
+            torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+            info["torch_cuda_version"] = torch_cuda_version if torch_cuda_version else "None (CPU-only)"
+
+            cuda_available = bool(torch.cuda.is_available())
+            info["cuda_available"] = str(cuda_available)
+            if not torch_cuda_version:
+                info["cuda_status"] = "检测到 CPU-only torch（torch.version.cuda=None）"
+            elif cuda_available:
+                info["cuda_status"] = "检测到 CUDA torch，CUDA 驱动可用"
+            else:
+                info["cuda_status"] = "检测到 CUDA torch，但驱动或设备不可用"
+        except Exception as exc:
+            info["torch_version"] = "导入失败"
+            info["torch_cuda_version"] = "-"
+            info["cuda_available"] = "-"
+            info["cuda_status"] = f"torch 检测异常: {exc}"
+
+        return info
+
+    def _refresh_runtime_info(self):
+        info = self._get_runtime_env_info()
+        self.runtime_info_var.set(
+            f"解释器路径: {info['python_executable']}\n"
+            f"torch 版本: {info['torch_version']}\n"
+            f"torch CUDA 版本: {info['torch_cuda_version']}\n"
+            f"torch.cuda.is_available(): {info['cuda_available']}\n"
+            f"CUDA 状态: {info['cuda_status']}"
+        )
+
     def _missing_packages(self) -> Tuple[List[str], List[str]]:
         missing_required, missing_optional = [], []
         for mod, pip_name in REQUIRED_PACKAGES.items():
@@ -248,10 +300,15 @@ class LimiXGuiApp:
         return missing_required, missing_optional
 
     def check_dependencies(self):
+        self._refresh_runtime_info()
         missing_required, missing_optional = self._missing_packages()
+        runtime_info = self._get_runtime_env_info()
+        cuda_tip = runtime_info["cuda_status"]
+
         if not missing_required and not missing_optional:
-            messagebox.showinfo("依赖检查", "依赖完整，可以运行。")
+            messagebox.showinfo("依赖检查", f"依赖完整，可以运行。\n{cuda_tip}")
             self.log("依赖检查完成: 全部已安装")
+            self.log(f"依赖检查 CUDA 状态: {cuda_tip}")
             return
 
         msg = []
@@ -259,6 +316,7 @@ class LimiXGuiApp:
             msg.append("缺失必需依赖: " + ", ".join(missing_required))
         if missing_optional:
             msg.append("缺失可选依赖: " + ", ".join(missing_optional))
+        msg.append("CUDA 检查: " + cuda_tip)
         text = "\n".join(msg)
         messagebox.showwarning("依赖检查结果", text)
         self.log(text)
@@ -281,6 +339,7 @@ class LimiXGuiApp:
                 messagebox.showerror("安装失败", f"安装依赖失败，退出码={result.returncode}\n{result.stderr[:500]}")
             else:
                 messagebox.showinfo("安装依赖", "依赖安装成功。")
+                self._refresh_runtime_info()
         except Exception as exc:
             self.log(f"安装依赖异常: {exc}")
             messagebox.showerror("安装失败", str(exc))
