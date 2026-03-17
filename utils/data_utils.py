@@ -292,20 +292,28 @@ def cluster_test_data(top_k_indices: torch.Tensor | List[torch.Tensor],
 
         seed = 42
         rng = np.random.default_rng(seed)
-        primes = np.uint64(4294967311)
-        a = torch.from_numpy(rng.integers(1, int(primes - 1), size=minhash_num_perm, dtype=np.uint64)).to(device)
-        b = torch.from_numpy(rng.integers(0, int(primes - 1), size=minhash_num_perm, dtype=np.uint64)).to(device)
+        primes = torch.tensor(4294967311, dtype=torch.int64, device=device)
+        a = torch.from_numpy(
+            rng.integers(1, int(primes.item() - 1), size=minhash_num_perm, dtype=np.int64)
+        ).to(device=device, dtype=torch.int64)
+        b = torch.from_numpy(
+            rng.integers(0, int(primes.item() - 1), size=minhash_num_perm, dtype=np.int64)
+        ).to(device=device, dtype=torch.int64)
 
-        minhash_signatures = torch.full((n_test_samples, minhash_num_perm), int(primes - 1), dtype=torch.int64,
-                                        device=device)
+        minhash_signatures = torch.full((n_test_samples, minhash_num_perm), int(primes.item() - 1),
+                                        dtype=torch.int64, device=device)
 
         source_sets = top_k_indices if is_list_input else [row for row in top_k_indices]
         for row_i, sample_indices_tensor in enumerate(source_sets):
             if sample_indices_tensor.numel() == 0:
                 continue
             vals = sample_indices_tensor.to(device=device, dtype=torch.int64)
+            assert vals.dtype == a.dtype == b.dtype == primes.dtype == torch.int64, (
+                f"MinHash dtype mismatch: vals={vals.dtype}, a={a.dtype}, b={b.dtype}, primes={primes.dtype}"
+            )
+            logger.debug("MinHash dtypes: vals=%s, a=%s, b=%s", vals.dtype, a.dtype, b.dtype)
             hashed = (vals.unsqueeze(1) * a.unsqueeze(0) + b.unsqueeze(0)) % primes
-            minhash_signatures[row_i] = hashed.min(dim=0).values.to(torch.int64)
+            minhash_signatures[row_i] = hashed.min(dim=0).values
 
         cluster_input = minhash_signatures.float()
     else:
