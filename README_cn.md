@@ -153,6 +153,25 @@ python limix_gui.py
 run_gui.bat
 ```
 
+### 如何保证 GUI 与命令行使用同一解释器
+- 推荐先激活你的虚拟环境/conda 环境，再启动 GUI。
+- `run_gui.sh` / `run_gui.bat` 会优先使用当前激活环境中的解释器（`VIRTUAL_ENV` 或 `CONDA_PREFIX`），避免误用系统 PATH 中的 Python。
+- 你也可以先确认当前解释器：
+
+```bash
+python -c "import sys; print(sys.executable)"
+./run_gui.sh
+```
+
+在 Windows（cmd）中可用：
+
+```bat
+python -c "import sys; print(sys.executable)"
+run_gui.bat
+```
+
+GUI 内“当前运行环境”区域会显示解释器路径、`torch` 版本、`torch.version.cuda` 和 `torch.cuda.is_available()`，可用于与命令行结果核对。
+
 ### 打包 exe（可选）
 ```bash
 pip install pyinstaller
