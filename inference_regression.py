@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import argparse
+import sys
 import pandas as pd
 from functools import partial
 from tqdm import tqdm
@@ -22,8 +23,61 @@ import torch.distributed as dist
 os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 from utils.utils import  download_datset, download_model
 
-if not torch.cuda.is_available():
-    raise SystemError('GPU device not found. For fast training, please enable GPU.')
+
+def resolve_device(device_arg):
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemError("--device=cuda was specified, but CUDA is not available.")
+        return torch.device("cuda")
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def retrieval_enabled(inference_config):
+    for conf in inference_config:
+        retrieval_cfg = conf.get("retrieval_config", {})
+        if retrieval_cfg.get("use_retrieval", False):
+            return True
+    return False
+
+
+def find_noretrieval_config_path(config_path):
+    path = Path(config_path)
+    if "noretrieval" in path.name:
+        return None
+
+    candidates = []
+    if "_retrieval" in path.name:
+        candidates.append(path.with_name(path.name.replace("_retrieval", "_noretrieval")))
+    if "retrieval" in path.name:
+        candidates.append(path.with_name(path.name.replace("retrieval", "noretrieval")))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def maybe_switch_to_noretrieval(config_path, device):
+    with open(config_path, 'r') as f:
+        inference_config = json.load(f)
+
+    if device.type == "cpu" and retrieval_enabled(inference_config):
+        fallback_config_path = find_noretrieval_config_path(config_path)
+        if fallback_config_path is not None:
+            print(
+                f"[Warning] CPU device detected and retrieval is enabled in {config_path}. "
+                f"Automatically switched to {fallback_config_path}."
+            )
+            with open(fallback_config_path, 'r') as f:
+                inference_config = json.load(f)
+            return fallback_config_path, inference_config
+        print(
+            f"[Warning] CPU device detected and retrieval is enabled in {config_path}, "
+            "but no matching *_noretrieval*.json file was found. Keep current config."
+        )
+    return config_path, inference_config
 
 def get_rank():
     if dist.is_available() and dist.is_initialized():
@@ -75,6 +129,7 @@ if __name__ == '__main__':
     parser.add_argument('--inference_with_DDP', default=False, action='store_true', help="Inference with DDP")
     parser.add_argument('--debug', default=False, action='store_true', help="debug mode")
     parser.add_argument('--search_space_sample_num', type=int, default=0, help="number of samples to search in the search space")
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'], help='inference device')
     args = parser.parse_args()
     model_file = args.model_path
     data_root = args.data_dir
@@ -93,18 +148,25 @@ if __name__ == '__main__':
     save_root = f"./result/{args.save_name}"
     os.makedirs(save_root, exist_ok=True)
 
+    device = resolve_device(args.device)
+    print(f"sys.executable: {sys.executable}")
+    print(f"torch.__version__: {torch.__version__}")
+    print(f"torch.version.cuda: {torch.version.cuda}")
+    print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
+    print(f"selected device: {device}")
+
     if not os.path.exists(args.inference_config_path):
         generate_infenerce_config(args)
 
-    with open(args.inference_config_path, 'r') as f:
-        inference_config = json.load(f)
+    args.inference_config_path, inference_config = maybe_switch_to_noretrieval(args.inference_config_path, device)
+    print(f"inference config: {args.inference_config_path}")
 
     save_result_path = os.path.join(save_root, f"all_rst.csv")
     save_config_path = os.path.join(save_root, "config.json")
     with open(save_config_path, "w") as f:
         json.dump(inference_config, f)
 
-    model = LimiXPredictor(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    model = LimiXPredictor(device=device,
                                 model_path=model_file, inference_config=inference_config,
                                 inference_with_DDP=args.inference_with_DDP)
     rng = np.random.default_rng(42)
@@ -200,5 +262,4 @@ if __name__ == '__main__':
 
 
     
-
 
