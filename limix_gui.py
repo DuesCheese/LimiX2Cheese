@@ -527,6 +527,9 @@ class LimiXGuiApp:
 
                 return np.asarray(work_df, dtype=np.float32), fit_info, work_df.columns.tolist()
 
+            label_encoder = None
+            class_mapping = None
+
             if run_cfg.task == "Missing Value Imputation":
                 source_df = _normalize_column_names(_normalize_missing_values(df))
                 feature_train_df = source_df[~source_df.isna().any(axis=1)].copy()
@@ -555,8 +558,12 @@ class LimiXGuiApp:
                         feature_test_df = test_part[feature_cols]
 
                 if run_cfg.task == "Classification":
-                    y_train = LabelEncoder().fit_transform(y_raw.fillna("__NA__"))
-                    y_train = np.asarray(y_train, dtype=np.int64)
+                    label_encoder = LabelEncoder()
+                    y_encoded = label_encoder.fit_transform(y_raw.fillna("__NA__"))
+                    y_train = np.asarray(y_encoded, dtype=np.int64)
+                    if len(label_encoder.classes_) < 2:
+                        raise ValueError("分类任务至少需要两个类别")
+                    class_mapping = {int(idx): str(name) for idx, name in enumerate(label_encoder.classes_)}
                 else:
                     y_train = np.asarray(y_raw, dtype=np.float32)
                     y_mean = float(np.nanmean(y_train)) if len(y_train) else 0.0
@@ -654,8 +661,14 @@ class LimiXGuiApp:
             pred_path = out_base / f"prediction_{run_cfg.task.replace(' ', '_')}_{now}.csv"
 
             if run_cfg.task == "Classification":
-                pred_df = pd.DataFrame(pred_values)
-                pred_df.insert(0, "pred_label", pred_df.values.argmax(axis=1))
+                if label_encoder is None:
+                    raise ValueError("分类标签编码器未初始化")
+                pred_label = pred_values.argmax(axis=1)
+                pred_label_raw = label_encoder.inverse_transform(pred_label)
+                prob_cols = [f"prob_{str(class_name)}" for class_name in label_encoder.classes_]
+                pred_df = pd.DataFrame(pred_values, columns=prob_cols)
+                pred_df.insert(0, "pred_label_raw", pred_label_raw)
+                pred_df.insert(0, "pred_label", pred_label)
             elif run_cfg.task == "Regression":
                 pred_df = feature_test_df.reset_index(drop=True).copy()
                 pred_col_name = f"pred_{run_cfg.target_columns[0]}"
@@ -802,8 +815,11 @@ class LimiXGuiApp:
             pred_df.to_csv(pred_path, index=False)
 
             meta_path = out_base / f"run_meta_{now}.json"
+            meta = dict(run_cfg.__dict__)
+            if class_mapping is not None:
+                meta["class_mapping"] = class_mapping
             with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(run_cfg.__dict__, f, ensure_ascii=False, indent=2)
+                json.dump(meta, f, ensure_ascii=False, indent=2)
 
             self.log(f"推理完成，结果已保存: {pred_path}")
             self.log(f"日志文件: {self.log_file_path}")
