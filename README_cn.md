@@ -184,12 +184,12 @@ pyinstaller --onefile --windowed --name LimiX2Cheese-GUI limix_gui.py
 考虑到推理速度、显存占用，基于样本检索的ensemble推理目前只支持基于版本高于NVIDIA-RTX 4090显卡的硬件条件。
 ### 分类任务
 ```
-python inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
+python inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --device auto
 ```
 
 ### 回归任务
 ```
-python inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
+python inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --device auto
 ```
 
 ### 个性化设置推理任务的数据预处理方式
@@ -201,7 +201,7 @@ generate_infenerce_config()
 ### 分类任务
 #### 单卡或者CPU
 ```
-python  inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
+python inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --device auto
 ```
 #### 多卡分布式推理
 ```
@@ -211,12 +211,20 @@ torchrun --nproc_per_node=8  inference_classifier.py --save_name your_save_name 
 ### 回归任务
 #### 单卡或者CPU
 ```
-python  inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
+python inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --device auto
 ```
 #### 多卡分布式推理
 ```
 torchrun --nproc_per_node=8  inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --inference_with_DDP
 ```
+
+#### CPU 启动示例（禁用检索）
+```
+python inference_classifier.py --save_name your_save_name --inference_config_path ./config/cls_default_noretrieval.json --data_dir path_to_data --device cpu
+python inference_regression.py --save_name your_save_name --inference_config_path ./config/reg_default_noretrieval.json --data_dir path_to_data --device cpu
+```
+> 说明：CPU 推理速度通常显著慢于 GPU（常见为数倍到数十倍，取决于数据规模与特征维度）。
+> 当使用 `--device auto` 且当前环境无 CUDA 时，程序会自动降级到 CPU；若配置启用了 retrieval，会自动切换到 `*_noretrieval*.json` 并输出告警。
 
 ### 样本检索的超参检索
 本项目提供了一个样本检测的超参搜索套件。为了获得最佳性能，我们使用 Optuna 对检索参数进行超参数优化
