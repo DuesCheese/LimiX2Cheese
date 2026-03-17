@@ -9,6 +9,7 @@ import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+from time import monotonic
 from pathlib import Path
 from typing import List, Tuple
 
@@ -68,6 +69,7 @@ class LimiXGuiApp:
         self.worker_thread = None
         self.stop_requested = False
         self.project_root = Path(__file__).resolve().parent
+        self.progress_started_at = None
 
         self.dataframe = None
         self.current_columns: List[str] = []
@@ -159,6 +161,9 @@ class LimiXGuiApp:
         self.progress = ttk.Progressbar(actions, mode="determinate", length=260)
         self.progress.pack(side=tk.LEFT, padx=10)
 
+        self.eta_var = tk.StringVar(value="预计剩余: --")
+        ttk.Label(actions, textvariable=self.eta_var).pack(side=tk.LEFT, padx=(0, 8))
+
         self.status_var = tk.StringVar(value="状态: 就绪")
         ttk.Label(actions, textvariable=self.status_var).pack(side=tk.LEFT)
 
@@ -176,6 +181,18 @@ class LimiXGuiApp:
 
     def _set_progress(self, value: int, message: str = None):
         self.progress["value"] = value
+
+        if value <= 0:
+            self.eta_var.set("预计剩余: --")
+        elif value >= 100:
+            self.eta_var.set("预计剩余: 00:00")
+        elif self.progress_started_at:
+            elapsed = monotonic() - self.progress_started_at
+            estimated_total = elapsed / (value / 100.0)
+            remaining_seconds = max(0, int(estimated_total - elapsed))
+            mins, secs = divmod(remaining_seconds, 60)
+            self.eta_var.set(f"预计剩余: {mins:02d}:{secs:02d}")
+
         if message:
             self.status_var.set(f"状态: {message}")
 
@@ -413,7 +430,9 @@ class LimiXGuiApp:
         self.log("=" * 80)
         self.log(f"任务开始，参数: {run_cfg}")
 
+        self.progress_started_at = monotonic()
         self.progress["value"] = 0
+        self.eta_var.set("预计剩余: --")
         self.worker_thread = threading.Thread(target=self._run_pipeline_thread, args=(run_cfg, file_handler), daemon=True)
         self.worker_thread.start()
 
@@ -832,6 +851,7 @@ class LimiXGuiApp:
             self.root.after(0, lambda: self._set_progress(0, "失败"))
             self.root.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
         finally:
+            self.progress_started_at = None
             self.logger.removeHandler(file_handler)
             file_handler.close()
 
