@@ -855,10 +855,11 @@ class LimiXGuiApp:
             self.root.after(0, lambda: messagebox.showinfo("完成", f"推理完成!\n输出: {pred_path}\n日志: {self.log_file_path}"))
 
         except Exception as exc:
-            self.log(f"运行失败: {exc}")
+            err_msg = str(exc)
+            self.log(f"运行失败: {err_msg}")
             self.log(traceback.format_exc())
             self.root.after(0, lambda: self._set_progress(0, "失败"))
-            self.root.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
+            self.root.after(0, lambda msg=err_msg: messagebox.showerror("运行失败", msg))
         finally:
             self.progress_started_at = None
             self.logger.removeHandler(file_handler)
