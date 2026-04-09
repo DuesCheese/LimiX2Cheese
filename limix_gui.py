@@ -544,7 +544,28 @@ class LimiXGuiApp:
                         mapping = fit_info["category"].get(col, {})
                         work_df[col] = work_df[col].astype("string").map(mapping)
 
-                return np.asarray(work_df, dtype=np.float32), fit_info, work_df.columns.tolist()
+                arr64 = np.asarray(work_df, dtype=np.float64)
+                inf_count = int(np.isinf(arr64).sum())
+
+                nonfinite_mask = ~np.isfinite(arr64)
+                if nonfinite_mask.any():
+                    arr64[nonfinite_mask] = np.nan
+
+                f32 = np.finfo(np.float32)
+                too_large = np.abs(arr64) > f32.max
+                overflow_count = int(too_large.sum())
+                if overflow_count:
+                    arr64[too_large] = np.nan
+
+                arr32 = arr64.astype(np.float32)
+                self.log(
+                    "特征数值清洗完成: "
+                    f"inf={inf_count}, "
+                    f"overflow_to_nan={overflow_count}, "
+                    f"total_nan={int(np.isnan(arr32).sum())}"
+                )
+
+                return arr32, fit_info, work_df.columns.tolist()
 
             label_encoder = None
             class_mapping = None
