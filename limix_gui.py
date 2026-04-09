@@ -593,6 +593,28 @@ class LimiXGuiApp:
             x_train, encoder_info, encoded_cols = _encode_features(feature_train_df)
             x_test, _, _ = _encode_features(feature_test_df, encoder_info)
 
+            encoded_col_names = [str(col) for col in encoded_cols]
+            non_finite_count = (~np.isfinite(x_train)).sum(axis=0)
+            over_limit_count = (np.abs(x_train.astype(np.float64)) > np.finfo(np.float32).max).sum(axis=0)
+            bad_col_summaries = []
+            for idx, col_name in enumerate(encoded_col_names):
+                nf_count = int(non_finite_count[idx])
+                ov_count = int(over_limit_count[idx])
+                if nf_count > 0 or ov_count > 0:
+                    summary = f"{col_name} (non-finite={nf_count}, overflow={ov_count})"
+                    bad_col_summaries.append(summary)
+                    self.log(f"坏值扫描命中 | 列={col_name} | non-finite={nf_count} | overflow={ov_count}")
+
+            if bad_col_summaries:
+                preview = "；".join(bad_col_summaries[:10])
+                extra = "" if len(bad_col_summaries) <= 10 else f"；... 另有 {len(bad_col_summaries) - 10} 列"
+                raise ValueError(
+                    "训练特征包含无法用于模型推理的坏值列: "
+                    + preview
+                    + extra
+                    + "。请检查原始 CSV 对应字段（常见原因：分母为 0、对数爆炸、字符串 'inf'）。"
+                )
+
             self.root.after(0, lambda: self._set_progress(45, "准备模型"))
 
             cuda_available = torch.cuda.is_available()
