@@ -107,7 +107,8 @@ class LimiXGuiApp:
         model_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(model_frame, text="模型文件(.ckpt，可选):").grid(row=0, column=0, sticky=tk.W)
-        self.model_path_var = tk.StringVar()
+        default_model_path = str((self.project_root / "model" / "LimiX-16M.ckpt").resolve())
+        self.model_path_var = tk.StringVar(value=default_model_path)
         ttk.Entry(model_frame, textvariable=self.model_path_var, width=78).grid(row=0, column=1, padx=5)
         ttk.Button(model_frame, text="选择模型", command=self.select_model_file).grid(row=0, column=2)
 
@@ -661,12 +662,15 @@ class LimiXGuiApp:
             use_cuda = cuda_available and not run_cfg.use_cpu
             device = torch.device("cuda" if use_cuda else "cpu")
 
-            if run_cfg.model_path:
+            if run_cfg.model_path and Path(run_cfg.model_path).exists():
                 model_path = run_cfg.model_path
             else:
                 repo_id = "stableai-org/LimiX-16M" if run_cfg.model_size == "16M" else "stableai-org/LimiX-2M"
                 filename = "LimiX-16M.ckpt" if run_cfg.model_size == "16M" else "LimiX-2M.ckpt"
-                self.log(f"未指定本地模型，开始下载: {repo_id}/{filename}")
+                if run_cfg.model_path:
+                    self.log(f"默认模型路径不存在，开始下载: {run_cfg.model_path}")
+                else:
+                    self.log(f"未指定本地模型，开始下载: {repo_id}/{filename}")
                 model_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(self.project_root / "cache"))
 
             if run_cfg.task == "Classification":
@@ -781,7 +785,7 @@ class LimiXGuiApp:
                 for idx, name in enumerate(encoded_cols):
                     importances.append({"feature": name, "impact": float(coeff[idx])})
                 pd.DataFrame(importances).sort_values("impact", key=lambda s: s.abs(), ascending=False).to_csv(
-                    out_base / f"feature_impact_{now}.csv", index=False
+                    out_base / f"feature_impact_{now}.csv", index=False, encoding="utf-8-sig"
                 )
 
                 relation_rows = []
@@ -806,7 +810,7 @@ class LimiXGuiApp:
                     )
 
                 pd.DataFrame(relation_rows).sort_values("causal_hint", key=lambda s: s.abs(), ascending=False).to_csv(
-                    out_base / f"feature_relation_{now}.csv", index=False
+                    out_base / f"feature_relation_{now}.csv", index=False, encoding="utf-8-sig"
                 )
                 self.log(f"已输出特征相关性/因果线索: {out_base / f'feature_relation_{now}.csv'}")
             else:
@@ -883,7 +887,7 @@ class LimiXGuiApp:
                         base.loc[missing_mask, col] = model.predict(x_pred)
                 pred_df = base
 
-            pred_df.to_csv(pred_path, index=False)
+            pred_df.to_csv(pred_path, index=False, encoding="utf-8-sig")
 
             meta_path = out_base / f"run_meta_{now}.json"
             meta = dict(run_cfg.__dict__)
